@@ -75,3 +75,106 @@ File 3D lengkap dapat dibuka langsung di Blender:
 - Simulasi Wokwi Penetasan: `esp32_incubator/diagram.json`
 - Simulasi Wokwi Candling: `esp32_candling/diagram.json`
 - File 3D Blender: `desain_3d_penetasan_dan_candling.blend`
+
+---
+
+## 🚀 Fitur Capture Telur Jarak Jauh (Laravel + ESP32-CAM)
+
+Fitur ini memungkinkan pengambilan citra telur (candling) secara jarak jauh:
+Dashboard Laravel membuat job pemotretan, ESP32-CAM AI-Thinker melakukan polling, menyalakan relay LED candling (GPIO14), mengambil foto, dan mengirimkan hasil JPEG ke server.
+
+### 1. Struktur Folder
+- `backend/` : Aplikasi Laravel (API Device, Controller Candling, Dashboard UI, Database Migrations, Scheduled Jobs).
+- `firmware/capture-telur/` : Source code firmware Arduino untuk board AI-Thinker ESP32-CAM (`capture-telur.ino` & `secrets.h`).
+
+### 2. Setup Server Laravel (`backend/`)
+1. Masuk ke direktori backend:
+   ```bash
+   cd backend
+   ```
+2. Salin environment dan generate key:
+   ```bash
+   cp .env.example .env
+   php artisan key:generate
+   ```
+3. Konfigurasi variabel `.env`:
+   ```env
+   APP_URL=https://domainkamu.com
+   DEVICE_KEY=isi-string-acak-minimal-32-karakter
+   DB_CONNECTION=sqlite
+   CACHE_STORE=database
+   ```
+4. Jalankan migrasi database dan buat symbolic link storage:
+   ```bash
+   php artisan migrate
+   php artisan storage:link
+   ```
+5. Konfigurasi Web Server (Nginx) — Wajib untuk upload JPEG hingga 5MB:
+   ```nginx
+   client_max_body_size 5M;
+   ```
+6. Jalankan scheduler Laravel (cron) untuk membersihkan file & job lebih dari 30 hari:
+   ```bash
+   php artisan schedule:run
+   ```
+
+### 3. Setup & Flash Firmware ESP32-CAM (`firmware/capture-telur/`)
+1. Salin template kredensial:
+   ```bash
+   cp firmware/capture-telur/secrets.h.example firmware/capture-telur/secrets.h
+   ```
+2. Isi nilai sebenarnya di `firmware/capture-telur/secrets.h`:
+   - `WIFI_SSID` : Nama WiFi router (contoh: "Telur").
+   - `WIFI_PASS` : Password WiFi router (contoh: "12345678").
+   - `SERVER_URL` : URL server tanpa trailing slash (contoh: "https://domainkamu.com").
+   - `DEVICE_KEY` : String yang sama persis dengan `DEVICE_KEY` di `.env` Laravel.
+3. Panduan Flashing AI-Thinker ESP32-CAM:
+   - Hubungkan pin **GPIO0 ke GND** sebelum menyalakan/memasukkan kabel USB-UART (masuk mode bootloader).
+   - Tekan tombol **RST**.
+   - Compile dan flash:
+     ```bash
+     arduino-cli compile --fqbn esp32:esp32:esp32cam firmware/capture-telur
+     arduino-cli upload -p <PORT_COM> --fqbn esp32:esp32:esp32cam firmware/capture-telur
+     ```
+   - Lepas kabel jumper **GPIO0 dari GND**, lalu tekan tombol **RST** sekali lagi agar firmware boot normal.
+
+### 4. Pengujian Manual via cURL
+1. Buat Job Pengambilan Foto:
+   ```bash
+   curl -X POST https://domainkamu.com/egg/capture \
+     -H "Content-Type: application/json" \
+     -d '{"exposure":500,"gain":0,"quality":6,"settle_ms":250}'
+   # Response: {"job": 1}
+   ```
+2. Simulasi Polling oleh ESP32:
+   ```bash
+   curl https://domainkamu.com/api/device/poll \
+     -H "X-Device-Key: <DEVICE_KEY>" \
+     -H "X-RSSI: -50"
+   # Response: job=1;exp=500;gain=0;q=6;delay=250
+   ```
+3. Simulasi Upload Foto JPEG Mentah oleh ESP32:
+   ```bash
+   curl -X POST "https://domainkamu.com/api/device/upload?job=1" \
+     -H "X-Device-Key: <DEVICE_KEY>" \
+     -H "Content-Type: image/jpeg" \
+     --data-binary "@foto_telur.jpg"
+   # Response: OK
+   ```
+4. Cek Status Job & Riwayat:
+   ```bash
+   curl https://domainkamu.com/egg/job/1
+   curl https://domainkamu.com/egg/history
+   curl https://domainkamu.com/egg/status
+   ```
+
+### 5. Troubleshooting Cepat
+- **HTTP 401 Unauthorized**: Header `X-Device-Key` tidak disertakan atau nilainya tidak cocok dengan `DEVICE_KEY` di `.env`.
+- **HTTP 409 Conflict**: Job yang di-upload belum dalam status `taken` atau sudah selesai (`done`/`failed`).
+- **HTTP 413 Payload Too Large**: Ukuran gambar melebihi batas Nginx. Pastikan `client_max_body_size 5M;` sudah ditambahkan pada block server Nginx.
+- **Kamera Gagal Inisialisasi**:
+  - Pastikan modul kamera terpasang rapat pada socket FPC.
+  - Periksa kecukupan arus power supply (ESP32-CAM butuh minimal 5V 2A stabil).
+  - Pastikan opsi PSRAM diaktifkan pada build configuration.
+- **Foto Terbalik / Rotasi Salah**:
+  - Sensor OV3660 memiliki default orientation berbeda. Pada fungsi `tuneSensor()`, sesuaikan pemanggilan `s->set_vflip(s, 1)` atau `s->set_hmirror(s, 1)`.

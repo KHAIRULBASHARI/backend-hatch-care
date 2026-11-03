@@ -5,6 +5,28 @@ __pycache__/
 venv/
 .env
 
+# Laravel
+/backend/vendor
+backend/vendor/
+/vendor
+node_modules/
+npm-debug.log
+yarn-error.log
+.env
+backend/.env
+.env.backup
+.env.production
+public/storage
+backend/public/storage
+public/hot
+backend/public/hot
+storage/*.key
+backend/storage/*.key
+
+# Firmware Secrets
+firmware/capture-telur/secrets.h
+secrets.h
+
 # Model weights & large datasets
 *.pt
 *.onnx
@@ -15,3 +37,5 @@ telemetry_log.csv
 # OS
 Thumbs.db
 .DS_Store
+.worktrees/
+.phpunit.result.cache
