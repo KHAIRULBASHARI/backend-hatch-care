@@ -40,14 +40,14 @@ return [
     ],
 
     'candling' => [
-        'api_url' => env('CANDLING_API_URL', 'http://127.0.0.1:5000/api/predict'),
-        'llm_url' => env('LLM_ROUTER_URL', 'https://router.walker880.my.id/v1/chat/completions'),
+        'api_url' => env('CANDLING_API_URL'),
+        'llm_url' => env('LLM_ROUTER_URL'),
         'llm_key' => env('LLM_ROUTER_KEY'),
-        'llm_model' => env('LLM_ROUTER_MODEL', 'antigravity/gemini-3.1-flash-lite'),
+        'llm_model' => env('LLM_ROUTER_MODEL'),
     ],
 
     'incubator' => [
-        'api_url' => env('INCUBATOR_YOLO_URL', env('INCUBATOR_API_URL', 'http://127.0.0.1:5001/api/incubator/detect')),
+        'api_url' => env('INCUBATOR_YOLO_URL', env('INCUBATOR_API_URL')),
     ],
 
 ];

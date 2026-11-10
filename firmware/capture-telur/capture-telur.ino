@@ -1,7 +1,7 @@
 /*
   ESP32-CAM AI-Thinker (OV3660 / OV2640) - Fitur Capture Telur Jarak Jauh
   Alur:
-  1. ESP polling ke server (GET /api/device/poll) tiap 3 detik.
+  1. ESP polling ke server (GET /api/device/poll) tiap 1 detik.
   2. Saat ada tugas pending -> server mengirim parameter (job, exp, gain, q, delay).
   3. ESP menyalakan kamera -> relay candling GPIO14 HIGH -> tunggu settle -> ambil frame JPEG.
   4. Relay candling kembali LOW -> salin citra ke buffer PSRAM -> kamera dinonaktifkan.
@@ -16,11 +16,16 @@
 #include "secrets.h"
 
 // ================= KONFIGURASI HARDWARE & JARINGAN =================
-#define POLL_MS        2000                 // Jeda polling ke server (milidetik)
+#define POLL_MS        1000                 // Jeda polling ke server (milidetik)
 #define TX_POWER       WIFI_POWER_19_5dBm   // Daya transmisi WiFi maksimal untuk upload cepat
 #define PIN_RELAY      14                   // Relay LED candling (HIGH trigger)
-#define JPEG_QUALITY   8                    // Kualitas JPEG optimal QXGA (tajam, hemat bandwidth)
 #define MAX_TRIES      3                    // Maksimum percobaan capture saat frame cacat
+#ifndef CAMERA_FRAME_SIZE
+  #define CAMERA_FRAME_SIZE FRAMESIZE_UXGA  // 1600x1200 native array tanpa sub-sampling noise
+#endif
+#ifndef JPEG_QUALITY
+  #define JPEG_QUALITY 4                    // Kualitas tinggi (kompresi minimal, bebas artifak blok)
+#endif
 
 // ================= PIN KAMERA AI-THINKER =================
 #define PWDN_GPIO_NUM  32
@@ -111,14 +116,17 @@ void tuneSensor() {
   s->set_whitebal(s, 1);
   s->set_awb_gain(s, 1);
   s->set_wb_mode(s, 0);
-  s->set_bpc(s, 1);
-  s->set_wpc(s, 1);
-  s->set_raw_gma(s, 1);
-  s->set_lenc(s, 1);
+  s->set_bpc(s, 1);               // Black pixel correction (buang hot pixel)
+  s->set_wpc(s, 1);               // White pixel correction (buang dead pixel)
+  s->set_dcw(s, 1);               // Defective pixel & dark-current correction
+  s->set_denoise(s, 1);           // Aktifkan hardware DSP Denoising (menghilangkan noise butiran)
+  s->set_raw_gma(s, 0);           // Matikan raw gamma booster agar noise latar belakang tidak terangkat
+  s->set_lenc(s, 1);              // Lens shading correction
   s->set_gainceiling(s, GAINCEILING_2X);
-  s->set_brightness(s, 0);
-  s->set_contrast(s, 0);
-  s->set_saturation(s, 0);
+  s->set_brightness(s, -1);       // -1 menekan noise floor sensor di area hitam
+  s->set_contrast(s, 2);          // +2 memperjelas pembuluh darah & membuat background hitam pekat
+  s->set_saturation(s, 1);        // +1 warna pembuluh darah merah-oranye lebih tegas
+  s->set_sharpness(s, 2);         // +2 ketajaman tepi pembuluh darah
 
   // Penyesuaian orientasi dan saturasi khusus sensor OV3660
   if (s->id.PID == OV3660_PID) {
@@ -127,10 +135,9 @@ void tuneSensor() {
   }
 }
 
-// Inisialisasi kamera on-demand dengan target resolusi QXGA (2048x1536)
+// Inisialisasi kamera on-demand dengan fallback resolusi lebih rendah.
 bool initCamera() {
-  // Coba inisialisasi urutan resolusi tertinggi yang didukung sensor (QXGA -> UXGA -> SXGA)
-  camera_config_t c = makeConfig(FRAMESIZE_QXGA);
+  camera_config_t c = makeConfig(CAMERA_FRAME_SIZE);
   if (esp_camera_init(&c) == ESP_OK) {
     tuneSensor();
     camCfg.valid = false;
@@ -138,7 +145,7 @@ bool initCamera() {
   }
 
   esp_camera_deinit();
-  c = makeConfig(FRAMESIZE_UXGA);
+  c = makeConfig(FRAMESIZE_XGA);
   if (esp_camera_init(&c) == ESP_OK) {
     tuneSensor();
     camCfg.valid = false;
@@ -146,7 +153,7 @@ bool initCamera() {
   }
 
   esp_camera_deinit();
-  c = makeConfig(FRAMESIZE_SXGA);
+  c = makeConfig(FRAMESIZE_SVGA);
   if (esp_camera_init(&c) == ESP_OK) {
     tuneSensor();
     camCfg.valid = false;
@@ -190,7 +197,7 @@ bool applyCamSettings(int ev, int gain, int q) {
   s->set_exposure_ctrl(s, 0);
   s->set_aec_value(s, ev);
   s->set_gain_ctrl(s, 0);
-  s->set_agc_gain(s, gain);
+  s->set_agc_gain(s, constrain(gain, 0, 10)); // Batasi gain analog agar tidak menimbulkan noise berlebih
 
   camCfg = {ev, gain, q, true};
   return true;
@@ -212,12 +219,12 @@ bool captureEgg(int ev, int gain, int q, int settle, uint8_t **out, size_t *outL
     return false;
   }
 
-  bool changed = applyCamSettings(ev, gain, q);
-  int warm = changed ? 3 : 1;
-
-  // Nyalakan lampu relay candling (GPIO14 HIGH)
+  // 1. Nyalakan lampu relay candling DULU agar sensor menerima cahaya penuh
   relaySet(true);
-  delay(settle);
+  delay(max(settle, 350)); // Beri waktu lampu LED stabil pada intensitas puncak
+
+  // 2. Terapkan parameter sensor
+  applyCamSettings(ev, gain, q);
 
   camera_fb_t *fb = NULL;
   int tries = 0;
@@ -225,10 +232,11 @@ bool captureEgg(int ev, int gain, int q, int settle, uint8_t **out, size_t *outL
 
   while (!fb && tries < MAX_TRIES) {
     tries++;
-    // Buang frame pemanasan sensor agar eksposur stabil
-    for (int i = 0; i < warm; i++) {
+    // Buang 3 frame awal setelah lampu menyala agar AGC/AEC internal dan AWB stabil
+    for (int i = 0; i < 3; i++) {
       camera_fb_t *old = esp_camera_fb_get();
       if (old) esp_camera_fb_return(old);
+      delay(40);
     }
 
     camera_fb_t *t = esp_camera_fb_get();
@@ -239,17 +247,17 @@ bool captureEgg(int ev, int gain, int q, int settle, uint8_t **out, size_t *outL
     if (t) esp_camera_fb_return(t);
     Serial.printf("[CAP] Percobaan %d gagal\n", tries);
 
-    warm = 3;
-    if (tries == 3) {
+    if (tries == MAX_TRIES - 1) {
       recoverCamera();
+      if (!camUp) break;
       applyCamSettings(ev, gain, qUsed);
     } else {
-      qUsed = min(qUsed + 2, 15);
+      qUsed = min(qUsed + 2, 12);
       sensor_t *s = esp_camera_sensor_get();
       if (s) s->set_quality(s, qUsed);
       camCfg.valid = false;
     }
-    delay(100);
+    delay(80);
   }
 
   // Pastikan relay SELALU mati setelah pemotretan
@@ -257,7 +265,7 @@ bool captureEgg(int ev, int gain, int q, int settle, uint8_t **out, size_t *outL
 
   bool ok = false;
   if (fb) {
-    *out = (uint8_t*)ps_malloc(fb->len);
+    *out = (uint8_t*)(psramFound() ? ps_malloc(fb->len) : malloc(fb->len));
     if (*out) {
       memcpy(*out, fb->buf, fb->len);
       *outLen = fb->len;
@@ -303,10 +311,12 @@ bool sendResult(int job, const uint8_t *buf, size_t len, bool fail) {
   http.addHeader("X-Device-Key", DEVICE_KEY);
   http.addHeader("Content-Type", fail ? "text/plain" : "image/jpeg");
 
+  unsigned long uploadStart = millis();
   int code = fail ? http.POST("fail") : http.POST((uint8_t*)buf, len);
+  unsigned long uploadMs = millis() - uploadStart;
   http.end();
 
-  Serial.printf("[UPLOAD] job=%d kode=%d ukuran=%uKB\n", job, code, (unsigned)(len / 1024));
+  Serial.printf("[UPLOAD] job=%d kode=%d ukuran=%uKB waktu=%lums\n", job, code, (unsigned)(len / 1024), uploadMs);
   return code == 200;
 }
 

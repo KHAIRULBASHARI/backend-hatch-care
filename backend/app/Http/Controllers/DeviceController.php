@@ -87,16 +87,20 @@ class DeviceController extends Controller
         $aiConfidence = null;
         $aiResult = null;
         try {
-            $apiUrl = config('services.candling.api_url', 'http://127.0.0.1:5000/api/predict');
-            $aiResponse = Http::timeout(15)
-                ->attach('image', $content, 'candling.jpg')
-                ->post($apiUrl);
+            $apiUrl = config('services.candling.api_url');
+            if ($apiUrl) {
+                $aiResponse = Http::timeout(15)
+                    ->attach('image', $content, 'candling.jpg')
+                    ->post($apiUrl);
 
-            if ($aiResponse->successful()) {
-                $resData = $aiResponse->json('data');
-                $aiLabel = $resData['label'] ?? null;
-                $aiConfidence = isset($resData['keyakinan']) ? (float) $resData['keyakinan'] : null;
-                $aiResult = $resData;
+                if ($aiResponse->successful()) {
+                    $resData = $aiResponse->json('data');
+                    $aiLabel = $resData['label'] ?? null;
+                    $aiConfidence = isset($resData['keyakinan']) ? (float) $resData['keyakinan'] : null;
+                    $aiResult = $resData;
+                }
+            } else {
+                Log::warning('CANDLING_API_URL belum dikonfigurasi.');
             }
         } catch (\Throwable $e) {
             Log::warning('Gagal memanggil API Candling NN: '.$e->getMessage());
@@ -122,9 +126,15 @@ class DeviceController extends Controller
         // 3. Eksekusi LLM Router di background (cepat ~6-8s dengan gemini-3.1-flash-lite)
         $llmAnalysis = null;
         try {
-            $llmUrl = config('services.candling.llm_url', 'https://router.walker880.my.id/v1/chat/completions');
+            $llmUrl = config('services.candling.llm_url');
             $llmKey = config('services.candling.llm_key');
-            $llmModel = config('services.candling.llm_model', 'antigravity/gemini-3.1-flash-lite');
+            $llmModel = config('services.candling.llm_model');
+
+            if (! $llmKey || ! $llmUrl) {
+                Log::warning('LLM_ROUTER_KEY atau LLM_ROUTER_URL belum dikonfigurasi.');
+
+                return response('OK');
+            }
 
             $labelDesc = $aiLabel ? strtoupper($aiLabel) : 'Tidak terdeteksi';
             $confDesc = $aiConfidence !== null ? round($aiConfidence * 100, 2).'%' : '-';

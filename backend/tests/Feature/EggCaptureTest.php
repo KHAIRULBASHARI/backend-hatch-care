@@ -4,9 +4,12 @@ namespace Tests\Feature;
 
 use App\Models\CaptureJob;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Http\UploadedFile;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Config;
+use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Storage;
+use Illuminate\Testing\TestResponse;
 use Tests\TestCase;
 
 class EggCaptureTest extends TestCase
@@ -72,7 +75,7 @@ class EggCaptureTest extends TestCase
         $this->assertNotNull(Cache::get('device:last_seen'));
     }
 
-    protected function postRaw(string $uri, string $content, array $headers = []): \Illuminate\Testing\TestResponse
+    protected function postRaw(string $uri, string $content, array $headers = []): TestResponse
     {
         $server = $this->transformHeadersToServerVars(array_merge([
             'X-Device-Key' => $this->validKey,
@@ -278,6 +281,61 @@ class EggCaptureTest extends TestCase
             'id' => $done2->id,
             'url' => Storage::disk('public')->url($done2->image_path),
         ]);
+    }
+
+    public function test_manual_candling_upload_returns_prediction_and_measured_timings(): void
+    {
+        Http::fake([
+            '*' => Http::response(['data' => [
+                'label' => 'fertil', 'keyakinan' => 0.92,
+            ]]),
+        ]);
+
+        $response = $this->postJson('/egg/upload', [
+            'image' => UploadedFile::fake()->image('egg.jpg', 32, 32),
+        ]);
+
+        $response->assertOk()->assertJsonPath('prediction_label', 'fertil')
+            ->assertJsonPath('confidence', 0.92)
+            ->assertJsonStructure(['id', 'url', 'prediction_result', 'metrics' => ['image_bytes', 'model_request_ms', 'server_processing_ms']]);
+        $this->assertGreaterThan(0, $response->json('metrics.image_bytes'));
+        $this->assertGreaterThanOrEqual(0, $response->json('metrics.model_request_ms'));
+        $this->assertDatabaseHas('capture_jobs', ['id' => $response->json('id'), 'status' => 'done', 'prediction_label' => 'fertil']);
+        $this->getJson('/egg/job/'.$response->json('id'))->assertJsonPath('metrics.image_bytes', $response->json('metrics.image_bytes'));
+    }
+
+    public function test_manual_upload_reports_llm_response_and_latency(): void
+    {
+        Config::set('services.candling.api_url', 'http://model.test/predict');
+        Config::set('services.candling.llm_url', 'http://llm.test/chat');
+        Config::set('services.candling.llm_key', 'test-key');
+        Http::fake([
+            'model.test/*' => Http::response(['data' => ['label' => 'fertil', 'keyakinan' => 0.92]]),
+            'llm.test/*' => Http::response(['choices' => [['message' => ['content' => 'Telur terlihat fertil.']]]]),
+        ]);
+
+        $response = $this->postJson('/egg/upload', ['image' => UploadedFile::fake()->image('egg.jpg')]);
+        $response->assertOk()->assertJsonPath('llm_analysis', 'Telur terlihat fertil.')
+            ->assertJsonPath('llm_status', 'success')->assertJsonStructure(['metrics' => ['llm_request_ms']]);
+        $this->getJson('/egg/job/'.$response->json('id'))->assertJsonPath('llm_analysis', 'Telur terlihat fertil.')
+            ->assertJsonPath('metrics.llm_request_ms', $response->json('metrics.llm_request_ms'));
+    }
+
+    public function test_manual_candling_upload_rejects_invalid_files(): void
+    {
+        $this->postJson('/egg/upload', [
+            'image' => UploadedFile::fake()->create('document.txt', 20, 'text/plain'),
+        ])->assertUnprocessable()->assertJsonValidationErrors('image');
+    }
+
+    public function test_manual_candling_upload_reports_model_failure(): void
+    {
+        Http::fake(['*' => Http::response([], 503)]);
+
+        $this->postJson('/egg/upload', [
+            'image' => UploadedFile::fake()->image('egg.jpg'),
+        ])->assertStatus(502)->assertJsonStructure(['message', 'metrics' => ['model_request_ms']]);
+        $this->assertDatabaseCount('capture_jobs', 0);
     }
 
     public function test_dashboard_renders_successfully(): void

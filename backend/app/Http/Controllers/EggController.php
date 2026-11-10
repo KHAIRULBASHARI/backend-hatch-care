@@ -5,6 +5,8 @@ namespace App\Http\Controllers;
 use App\Models\CaptureJob;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
 
 class EggController extends Controller
@@ -28,6 +30,89 @@ class EggController extends Controller
         return response()->json(['job' => $job->id]);
     }
 
+    public function upload(Request $request)
+    {
+        $started = hrtime(true);
+        $request->validate(['image' => ['required', 'file', 'image', 'mimes:jpg,jpeg,png', 'max:5120']]);
+
+        $file = $request->file('image');
+        $content = file_get_contents($file->getRealPath());
+        $metrics = ['image_bytes' => strlen($content)];
+        $modelStarted = hrtime(true);
+
+        $apiUrl = config('services.candling.api_url');
+        if (! $apiUrl) {
+            return response()->json(['message' => 'CANDLING_API_URL belum dikonfigurasi.', 'metrics' => $metrics], 500);
+        }
+
+        try {
+            $response = Http::timeout(15)
+                ->attach('image', $content, 'candling.'.$file->guessExtension())
+                ->post($apiUrl);
+            $metrics['model_request_ms'] = round((hrtime(true) - $modelStarted) / 1_000_000, 2);
+            $prediction = $response->json('data');
+            if (! $response->successful() || ! is_array($prediction) || empty($prediction['label'])) {
+                return response()->json(['message' => 'Model candling tidak dapat memproses gambar.', 'metrics' => $metrics], 502);
+            }
+        } catch (\Throwable $e) {
+            Log::warning('Gagal memanggil API Candling NN: '.$e->getMessage());
+            $metrics['model_request_ms'] = round((hrtime(true) - $modelStarted) / 1_000_000, 2);
+
+            return response()->json(['message' => 'Layanan model candling tidak tersedia.', 'metrics' => $metrics], 502);
+        }
+
+        $image = 'data:'.$file->getMimeType().';base64,'.base64_encode($content);
+        $llmAnalysis = null;
+        $llmStatus = 'not_configured';
+        $metrics['llm_request_ms'] = null;
+        if (($key = config('services.candling.llm_key')) && ($llmUrl = config('services.candling.llm_url'))) {
+            $llmPrediction = $prediction;
+            unset($llmPrediction['visualisasi']);
+            $llmStarted = hrtime(true);
+            try {
+                $llmResponse = Http::timeout(45)->withToken($key)->post($llmUrl, [
+                    'model' => config('services.candling.llm_model'),
+                    'messages' => [
+                        ['role' => 'system', 'content' => 'Jelaskan hasil candling telur dengan bahasa Indonesia yang sederhana. Berikan ringkasan, kondisi visual, dan saran tindakan. Sampaikan jika hasil tidak pasti.'],
+                        ['role' => 'user', 'content' => [
+                            ['type' => 'text', 'text' => 'Hasil model: '.json_encode($llmPrediction, JSON_UNESCAPED_UNICODE | JSON_PARTIAL_OUTPUT_ON_ERROR)],
+                            ['type' => 'image_url', 'image_url' => ['url' => $image]],
+                        ]],
+                    ],
+                    'max_tokens' => 500,
+                ]);
+                $llmAnalysis = $llmResponse->successful() ? $llmResponse->json('choices.0.message.content') : null;
+                $llmStatus = is_string($llmAnalysis) && $llmAnalysis !== '' ? 'success' : 'failed';
+            } catch (\Throwable $e) {
+                Log::warning('Gagal memanggil LLM candling: '.$e->getMessage());
+                $llmStatus = 'failed';
+            }
+            $metrics['llm_request_ms'] = round((hrtime(true) - $llmStarted) / 1_000_000, 2);
+        }
+        $metrics['server_processing_ms'] = round((hrtime(true) - $started) / 1_000_000, 2);
+        $prediction['_metrics'] = $metrics;
+        $prediction['_llm_status'] = $llmStatus;
+        $job = CaptureJob::create([
+            'status' => 'done',
+            'image_base64' => $image,
+            'llm_analysis' => $llmAnalysis,
+            'prediction_label' => $prediction['label'],
+            'confidence' => $prediction['keyakinan'] ?? null,
+            'prediction_result' => $prediction,
+        ]);
+
+        return response()->json([
+            'id' => $job->id,
+            'url' => $job->image_base64,
+            'prediction_label' => $job->prediction_label,
+            'confidence' => $job->confidence,
+            'prediction_result' => $prediction,
+            'llm_analysis' => $llmAnalysis,
+            'llm_status' => $llmStatus,
+            'metrics' => $metrics,
+        ]);
+    }
+
     /**
      * Show job status and image URL.
      */
@@ -39,6 +124,7 @@ class EggController extends Controller
             'prediction_label' => $job->prediction_label,
             'confidence' => $job->confidence,
             'prediction_result' => $job->prediction_result,
+            'metrics' => $job->prediction_result['_metrics'] ?? null,
             'llm_analysis' => $job->llm_analysis,
         ]);
     }

@@ -244,4 +244,96 @@ class IncubatorTest extends TestCase
             'total_eggs' => 5,
         ]);
     }
+
+    public function test_capture_interval_is_saved_and_validated(): void
+    {
+        $this->freezeTime();
+        $this->getJson('/api/incubator/control')
+            ->assertOk()->assertJsonPath('control.captureIntervalSeconds', 20);
+
+        foreach ([5, 3600] as $valid) {
+            $this->postJson('/api/incubator/control', ['captureIntervalSeconds' => $valid])
+                ->assertOk()->assertJsonPath('control.captureIntervalSeconds', $valid);
+        }
+
+        $this->postJson('/api/incubator/control', ['captureIntervalSeconds' => 90])
+            ->assertOk()->assertJsonPath('control.captureIntervalSeconds', 90);
+
+        foreach ([4, 3601, 5.5] as $invalid) {
+            $this->postJson('/api/incubator/control', ['captureIntervalSeconds' => $invalid])
+                ->assertUnprocessable();
+        }
+
+        $this->getJson('/api/incubator/control')
+            ->assertJsonPath('control.captureIntervalSeconds', 90);
+        Cache::put('incubator:last_seen', now()->subSeconds(100)->timestamp, 3600);
+        Cache::put('incubator:latest_image', 'data:image/jpeg;base64,AA==', 3600);
+        $this->getJson('/api/incubator/latest')->assertJsonPath('online', true);
+    }
+
+    public function test_motor_command_is_retained_until_matching_device_acknowledgement(): void
+    {
+        Http::preventStrayRequests();
+        Http::fake(['http://127.0.0.1:5001/api/incubator/detect' => Http::response(['status' => 'success', 'total_eggs' => 0], 200)]);
+        $created = $this->postJson('/api/incubator/control', ['motorManualRequest' => true])
+            ->assertOk();
+        $id = $created->json('control.motorCommandId');
+        $this->assertIsString($id);
+
+        $this->getJson('/api/incubator/control')->assertJsonPath('control.motorCommandId', $id);
+        $jpeg = "\xFF\xD8".str_repeat('A', 1500)."\xFF\xD9";
+        $this->postRaw('/api/incubator/upload', $jpeg)
+            ->assertOk()->assertJsonPath('control.motorCommandId', $id);
+        $this->getJson('/api/incubator/device-control?motorAck='.$id)->assertUnauthorized();
+        $this->withHeader('X-Device-Key', $this->validKey)
+            ->getJson('/api/incubator/device-control?motorAck=other')
+            ->assertJsonPath('control.motorCommandId', $id);
+        $this->getJson('/api/incubator/device-control?motorAck='.$id)
+            ->assertJsonPath('control.motorManualRequest', false)
+            ->assertJsonPath('control.motorCommandId', null);
+
+        $nextId = $this->postJson('/api/incubator/control', ['triggerMotor' => true])
+            ->assertOk()->json('control.motorCommandId');
+        $this->assertNotSame($id, $nextId);
+        $this->getJson('/api/incubator/device-control?motorAck='.$id)
+            ->assertJsonPath('control.motorCommandId', $nextId);
+    }
+
+    public function test_motor_acknowledgement_works_with_database_cache(): void
+    {
+        Cache::setDefaultDriver('database');
+        $id = $this->postJson('/api/incubator/control', ['triggerMotor' => true])
+            ->assertOk()->json('control.motorCommandId');
+
+        $this->withHeader('X-Device-Key', $this->validKey)
+            ->getJson('/api/incubator/device-control?motorAck='.$id)
+            ->assertOk()->assertJsonPath('control.motorManualRequest', false);
+    }
+
+    public function test_invalid_sensor_reading_clears_old_telemetry(): void
+    {
+        Http::preventStrayRequests();
+        Http::fake(['http://127.0.0.1:5001/api/incubator/detect' => Http::response(['status' => 'success', 'total_eggs' => 0], 200)]);
+        Cache::put('incubator:temperature', 37.5, 3600);
+        Cache::put('incubator:humidity', 60.0, 3600);
+        $jpeg = "\xFF\xD8".str_repeat('A', 1500)."\xFF\xD9";
+
+        $this->postRaw('/api/incubator/upload', $jpeg, [
+            'X-Temp-Valid' => '0',
+            'X-Humidity-Valid' => '0',
+        ])->assertOk();
+
+        $this->getJson('/api/incubator/latest')
+            ->assertJsonPath('temperature', null)
+            ->assertJsonPath('humidity', null);
+
+        $this->postRaw('/api/incubator/upload', $jpeg, [
+            'X-Temp' => '37.2',
+            'X-Humidity-Valid' => '0',
+        ])->assertOk();
+
+        $this->getJson('/api/incubator/latest')
+            ->assertJsonPath('temperature', 37.2)
+            ->assertJsonPath('humidity', null);
+    }
 }

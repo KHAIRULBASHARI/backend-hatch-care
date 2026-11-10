@@ -1,7 +1,7 @@
 /*
   ESP32-CAM AI-Thinker (OV3660 / OV2640) - Fitur Capture Telur Jarak Jauh
   Alur:
-  1. ESP polling ke server (GET /api/device/poll) tiap 3 detik.
+  1. ESP polling ke server (GET /api/device/poll) tiap 1 detik.
   2. Saat ada tugas pending -> server mengirim parameter (job, exp, gain, q, delay).
   3. ESP menyalakan kamera -> relay candling GPIO14 HIGH -> tunggu settle -> ambil frame JPEG.
   4. Relay candling kembali LOW -> salin citra ke buffer PSRAM -> kamera dinonaktifkan.
@@ -16,11 +16,16 @@
 #include "secrets.h"
 
 // ================= KONFIGURASI HARDWARE & JARINGAN =================
-#define POLL_MS        2000                 // Jeda polling ke server (milidetik)
+#define POLL_MS        1000                 // Jeda polling ke server (milidetik)
 #define TX_POWER       WIFI_POWER_19_5dBm   // Daya transmisi WiFi maksimal untuk upload cepat
 #define PIN_RELAY      14                   // Relay LED candling (HIGH trigger)
-#define JPEG_QUALITY   8                    // Kualitas JPEG optimal QXGA (tajam, hemat bandwidth)
 #define MAX_TRIES      3                    // Maksimum percobaan capture saat frame cacat
+#ifndef CAMERA_FRAME_SIZE
+  #define CAMERA_FRAME_SIZE FRAMESIZE_SXGA  // 1280x1024; dapat diubah lewat secrets.h
+#endif
+#ifndef JPEG_QUALITY
+  #define JPEG_QUALITY 10                   // Kualitas awal; slider web dapat mengubahnya
+#endif
 
 // ================= PIN KAMERA AI-THINKER =================
 #define PWDN_GPIO_NUM  32
@@ -127,10 +132,9 @@ void tuneSensor() {
   }
 }
 
-// Inisialisasi kamera on-demand dengan target resolusi QXGA (2048x1536)
+// Inisialisasi kamera on-demand dengan fallback resolusi lebih rendah.
 bool initCamera() {
-  // Coba inisialisasi urutan resolusi tertinggi yang didukung sensor (QXGA -> UXGA -> SXGA)
-  camera_config_t c = makeConfig(FRAMESIZE_QXGA);
+  camera_config_t c = makeConfig(CAMERA_FRAME_SIZE);
   if (esp_camera_init(&c) == ESP_OK) {
     tuneSensor();
     camCfg.valid = false;
@@ -138,7 +142,7 @@ bool initCamera() {
   }
 
   esp_camera_deinit();
-  c = makeConfig(FRAMESIZE_UXGA);
+  c = makeConfig(FRAMESIZE_XGA);
   if (esp_camera_init(&c) == ESP_OK) {
     tuneSensor();
     camCfg.valid = false;
@@ -146,7 +150,7 @@ bool initCamera() {
   }
 
   esp_camera_deinit();
-  c = makeConfig(FRAMESIZE_SXGA);
+  c = makeConfig(FRAMESIZE_SVGA);
   if (esp_camera_init(&c) == ESP_OK) {
     tuneSensor();
     camCfg.valid = false;
@@ -213,7 +217,7 @@ bool captureEgg(int ev, int gain, int q, int settle, uint8_t **out, size_t *outL
   }
 
   bool changed = applyCamSettings(ev, gain, q);
-  int warm = changed ? 3 : 1;
+  int warm = changed ? 2 : 1;
 
   // Nyalakan lampu relay candling (GPIO14 HIGH)
   relaySet(true);
@@ -240,8 +244,9 @@ bool captureEgg(int ev, int gain, int q, int settle, uint8_t **out, size_t *outL
     Serial.printf("[CAP] Percobaan %d gagal\n", tries);
 
     warm = 3;
-    if (tries == 3) {
+    if (tries == MAX_TRIES - 1) {
       recoverCamera();
+      if (!camUp) break;
       applyCamSettings(ev, gain, qUsed);
     } else {
       qUsed = min(qUsed + 2, 15);
@@ -257,7 +262,7 @@ bool captureEgg(int ev, int gain, int q, int settle, uint8_t **out, size_t *outL
 
   bool ok = false;
   if (fb) {
-    *out = (uint8_t*)ps_malloc(fb->len);
+    *out = (uint8_t*)(psramFound() ? ps_malloc(fb->len) : malloc(fb->len));
     if (*out) {
       memcpy(*out, fb->buf, fb->len);
       *outLen = fb->len;
@@ -303,10 +308,12 @@ bool sendResult(int job, const uint8_t *buf, size_t len, bool fail) {
   http.addHeader("X-Device-Key", DEVICE_KEY);
   http.addHeader("Content-Type", fail ? "text/plain" : "image/jpeg");
 
+  unsigned long uploadStart = millis();
   int code = fail ? http.POST("fail") : http.POST((uint8_t*)buf, len);
+  unsigned long uploadMs = millis() - uploadStart;
   http.end();
 
-  Serial.printf("[UPLOAD] job=%d kode=%d ukuran=%uKB\n", job, code, (unsigned)(len / 1024));
+  Serial.printf("[UPLOAD] job=%d kode=%d ukuran=%uKB waktu=%lums\n", job, code, (unsigned)(len / 1024), uploadMs);
   return code == 200;
 }
 

@@ -1,22 +1,25 @@
 /**
  * ====================================================================================
- * SISTEM CERDAS MONITORING PENETASAN TELUR AYAM - UNIT PENETASAN (INCUBATOR FIRMWARE)
- * Board   : AI Thinker ESP32-CAM (OV2640 / OV3660)
- * Fitur   :
- *  1. Kamera On-Demand Resolusi Maksimal (QXGA 2048x1536 OV3660 / UXGA 1600x1200 OV2640).
- *  2. Background Auto-Upload Non-Blocking setiap 20 detik ke Cloud API.
- *  3. Local Web Server (/ , /capture , /led , /status , /turn) untuk direct browser debugging.
- *  4. Sensor DHT22 untuk suhu & kelembaban real-time.
- *  5. Kontrol Termostat Lampu Pemanas & Kipas Sirkulasi Otomatis (Hysteresis).
- *  6. Kontrol Timer Pembalik Telur Dinamo Otomatis & Manual.
- *  7. Display LCD 16x4 I2C dengan auto-detect.
+ * INKUBATOR PENETAS TELUR - ESP32-CAM (AI-Thinker, OV2640 / OV3660)
+ *
+ * Pembagian kerja dual-core:
+ *   Core 1 (loop)      : web server lokal, DHT22, termostat, relay, motor, LCD.
+ *   Core 0 (cloudTask) : upload foto + polling kontrol ke server.
+ *
+ * Anti-lag jangka panjang:
+ *   1. FastWebServer memotong batas tunggu socket kosong Chrome (preconnect) dari 5000 ms ke 200 ms.
+ *   2. esp_wifi_set_ps(WIFI_PS_NONE) dipanggil setelah WiFi.begin() agar radio tidak masuk sleep.
+ *   3. cameraMutex hanya dikunci saat jepret hardware (~0.5 s), TIDAK dikunci saat upload/poll HTTPS.
+ *   4. Kamera dinyalakan on-demand (UXGA 1600x1200) lalu langsung camStop() sebelum kirim WiFi.
  * ====================================================================================
  */
 
 #include "esp_camera.h"
+#include "esp_wifi.h"
 #include <WiFi.h>
-#include <WiFiClientSecure.h>
 #include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <Preferences.h>
 #include <WebServer.h>
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
@@ -25,11 +28,10 @@
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
 
-// ─── 1. KREDENSIAL & KONFIGURASI CLOUD ──────────────────────────────────────────────
+// ─── KONFIGURASI ──────────────────────────────────────────────────────────────────
 #if __has_include("secrets.h")
   #include "secrets.h"
 #endif
-
 #ifndef WIFI_SSID
   #define WIFI_SSID  "Telur"
 #endif
@@ -42,31 +44,22 @@
 #ifndef DEVICE_KEY
   #define DEVICE_KEY "EggCamSecretKey_9876543210_abcdef1234567890"
 #endif
+#ifndef CAMERA_FRAME_SIZE
+  #define CAMERA_FRAME_SIZE FRAMESIZE_UXGA  // 1600x1200 (UXGA)
+#endif
+#ifndef JPEG_QUALITY
+  #define JPEG_QUALITY 4                    // Kualitas mentok tertinggi (4 = kompresi minimal, sangat tajam)
+#endif
 
-// Endpoint Cloud untuk background upload
-const char* UPLOAD_ENDPOINT = "/api/incubator/upload";
-
-// Interval Auto Upload (milidetik) - 20 detik
-const unsigned long AUTO_UPLOAD_INTERVAL = 20000;
-
-// ─── 2. PIN DEFINITION (AI-THINKER ESP32-CAM) ───────────────────────────────────────
-// Sesuai konfigurasi hardware:
-// SDA = 14, SCL = 13, DHT = 15, RELAY_LAMP = 4, RELAY_MOTOR = 2 (Active HIGH)
-#define PIN_I2C_SDA      14   // SDA LCD I2C
-#define PIN_I2C_SCL      13   // SCL LCD I2C
-#define PIN_DHT          15   // Data pin DHT22 (GPIO 15)
-#define PIN_RELAY_HEATER 4    // Relay 1: Lampu Pemanas (GPIO 4, Active HIGH, berbagi dgn Flash LED)
-#define PIN_RELAY_MOTOR  2    // Relay 2: Dinamo Pembalik Telur (GPIO 2, Active HIGH)
-#define PIN_RELAY_FAN    -1   // Kipas nonaktif / opsional (-1 jika tidak dipakai)
-#define PIN_FLASH_LED    4    // Flash LED (GPIO 4)
-
-#define DHTTYPE          DHT22
-
-// Modul Relay Active HIGH (HIGH = ON, LOW = OFF)
+// Pin AI-Thinker
+#define PIN_I2C_SDA      14
+#define PIN_I2C_SCL      13
+#define PIN_DHT          15
+#define PIN_RELAY_HEATER 4    // berbagi dengan LED flash onboard
+#define PIN_RELAY_MOTOR  2
 #define RELAY_ON         HIGH
 #define RELAY_OFF        LOW
 
-// Kamera AI-Thinker OV2640 / OV3660
 #define PWDN_GPIO_NUM    32
 #define RESET_GPIO_NUM   -1
 #define XCLK_GPIO_NUM     0
@@ -84,275 +77,214 @@ const unsigned long AUTO_UPLOAD_INTERVAL = 20000;
 #define HREF_GPIO_NUM    23
 #define PCLK_GPIO_NUM    22
 
-#define JPEG_QUALITY     10   // Kualitas kompresi JPEG (10 = jernih & tajam)
-#define MAX_TRIES        3    // Maksimum percobaan capture saat frame cacat
+// Batas waktu & keamanan
+const uint32_t RELAY_MIN_SWITCH_MS   = 3000;   // relay minimal 3 s di satu status (anti-kedip cepat)
+const uint32_t PHOTO_LIGHT_HOLD_MS   = 3500;   // lampu warm & LED menyala 3.5 s saat jadwal foto tiba
+const uint32_t PHOTO_LIGHT_WARMUP_MS = 450;    // pemanasan filamen sebelum jepret
+const uint32_t SENSOR_SETTLE_MS      = 220;    // waktu stabilisasi AWB/AEC sensor
+const float    TEMP_HARD_LIMIT       = 40.5f;  // di atas ini lampu dipaksa mati, mode apa pun
+const uint32_t CONTROL_POLL_MS       = 3000;
+const uint32_t UPLOAD_MIN_S          = 15;     // mengikuti interval minimal di web (15 detik)
+const uint32_t UPLOAD_MAX_S          = 3600;
+const uint8_t  DHT_MAX_FAILS         = 3;      // NaN sesaat dari DHT tidak memutus relay
+const int      CAPTURE_TRIES         = 3;
 
-// ─── 3. PARAMETER & VARIABEL KONTROL INKUBATOR ──────────────────────────────────────
-float tempSetpointMin = 37.0; // Batas bawah lampu ON (°C)
-float tempSetpointMax = 38.0; // Batas atas lampu OFF (°C)
-String lampMode       = "auto"; // "auto", "on", "off" dari kontrol jarak jauh cloud
+enum LampMode : uint8_t { LAMP_AUTO, LAMP_ON, LAMP_OFF };
+static const char *const LAMP_MODE_NAME[] = {"auto", "on", "off"};
 
-// Interval Pembalikan Telur (Default: Tiap 4 jam sekali, motor menyala 15 detik)
-unsigned long motorIntervalMs = 4UL * 60UL * 60UL * 1000UL; // 4 jam
-unsigned long motorDurationMs = 15000UL;                    // 15 detik
-unsigned long lastMotorTurn   = 0;
-bool isMotorRunning           = false;
-unsigned long motorStartTime  = 0;
+// WebServer yang memutus socket preconnect kosong Chrome dalam 200 ms (bukan 5000 ms).
+class FastWebServer : public WebServer {
+public:
+  using WebServer::WebServer;
+  void handleClient() {
+    if (_currentStatus == HC_WAIT_READ && !_currentClient.available() &&
+        millis() - _statusChange > 200) {
+      _currentClient = NetworkClient();
+      _currentStatus = HC_NONE;
+    }
+    WebServer::handleClient();
+  }
+};
 
-// Variabel Sensor & Aktuator
-float currentTemp = 0.0;
-float currentHum  = 0.0;
-bool heaterState  = false;
-bool fanState     = false;
+// ─── STATE BERSAMA ────────────────────────────────────────────────────────────────
+volatile float    tempSetpointMin   = 37.0f;
+volatile float    tempSetpointMax   = 38.0f;
+volatile uint8_t  lampMode          = LAMP_AUTO;
+volatile uint32_t motorIntervalMs   = 4UL * 3600000UL;
+volatile uint32_t motorDurationMs   = 15000UL;
+volatile uint32_t uploadIntervalMs  = 120000UL;
+volatile bool     motorRequest      = false;
+volatile bool     manualLight       = false;
 
-// Kontrol Jarak Jauh Cloud
-unsigned long lastControlPoll = 0;
-const unsigned long CONTROL_POLL_MS = 3500; // Polling cloud tiap 3.5 detik
+volatile float    currentTemp = NAN;
+volatile float    currentHum  = NAN;
+volatile bool     heaterState = false;
+volatile bool     isMotorRunning = false;
 
-// Kontrol LED Flash
-bool flashLedAuto    = true;  // Flash menyala otomatis saat capture/upload
-bool manualLedState  = false; // Status manual lampu LED via web /led
+volatile int      lastUploadCode  = 0;
+volatile uint32_t lastUploadTime  = 0;
+volatile uint32_t lastUploadBytes = 0;
 
-// Status Upload & Jaringan
-unsigned long lastUpload      = 0;
-int lastUploadCode            = 0;
-unsigned long lastUploadTime  = 0;
-size_t lastUploadBytes        = 0;
-volatile bool uploadInProgress = false;
+volatile uint32_t photoLightUntil   = 0;
+volatile uint32_t localWebBusyUntil = 0;
+bool     heaterPinOn = false;
+uint32_t heaterPinChangedAt = 0;
+uint32_t motorStartTime = 0;
+uint32_t lastMotorTurn  = 0;
 
-// Deteksi Hardware
-bool lcdAvailable = false;
-bool camUp        = false;
+char     lastMotorCommandId[48] = "";
+uint32_t storedUploadSeconds = 120;
 
-// ─── 4. OBJEK & RTOS HANDLERS ───────────────────────────────────────────────────────
-DHT dht(PIN_DHT, DHTTYPE);
-LiquidCrystal_I2C lcd(0x27, 16, 4);
-WebServer server(80);
+portMUX_TYPE      heaterMux   = portMUX_INITIALIZER_UNLOCKED;
+SemaphoreHandle_t cameraMutex = NULL;          // HANYA mengunci saat kamera fisik memotret
+bool              camUp       = false;
 
-SemaphoreHandle_t cameraMutex = NULL;
-TaskHandle_t uploadTaskHandle = NULL;
+// Dua buffer PSRAM terpisah agar web lokal dan upload cloud tidak pernah saling tunggu
+struct PhotoBuffer {
+  uint8_t *buf = nullptr;
+  size_t   len = 0;
+  size_t   cap = 0;
+};
+PhotoBuffer localPhoto;
+PhotoBuffer cloudPhoto;
 
-// Deteksi otomatis protokol TLS dari awalan SERVER_URL
-static inline bool useTls() {
-  return strncmp(SERVER_URL, "https", 5) == 0;
+DHT dht(PIN_DHT, DHT22);
+LiquidCrystal_I2C *lcd = nullptr;
+FastWebServer server(80);
+
+static inline bool useTls() { return strncmp(SERVER_URL, "https", 5) == 0; }
+
+// ─── RELAY LAMPU PEMANAS ──────────────────────────────────────────────────────────
+void applyHeaterPin() {
+  uint32_t now = millis();
+  float t = currentTemp;
+  bool overheat = isfinite(t) && t >= TEMP_HARD_LIMIT;
+  bool tempValid = isfinite(t) && t > 0;
+  bool canHeat = tempValid && !overheat && heaterState;
+  bool canLight = !overheat && (!tempValid || t < tempSetpointMax + 0.5f) &&
+                  (manualLight || (int32_t)(photoLightUntil - now) > 0);
+  bool want = canHeat || canLight;
+  if (want == heaterPinOn) return;
+  if (!overheat && heaterPinChangedAt != 0 && now - heaterPinChangedAt < RELAY_MIN_SWITCH_MS) return;
+
+  heaterPinOn = want;
+  heaterPinChangedAt = now;
+  digitalWrite(PIN_RELAY_HEATER, want ? RELAY_ON : RELAY_OFF);
 }
 
-// ─── 5. KONTROL LED & RELAY ────────────────────────────────────────────────────────
-void setFlashLed(bool on) {
-  digitalWrite(PIN_FLASH_LED, on ? HIGH : LOW);
+void refreshHeaterPin() {
+  portENTER_CRITICAL(&heaterMux);
+  applyHeaterPin();
+  portEXIT_CRITICAL(&heaterMux);
 }
 
-void triggerMotorTurn() {
-  if (isMotorRunning) return; // Mencegah re-trigger ganda
-  digitalWrite(PIN_RELAY_MOTOR, RELAY_ON);
-  isMotorRunning = true;
-  motorStartTime = millis();
-  Serial.println("[MOTOR] Pembalik telur MULAI berputar.");
+uint32_t requestPhotoLight() {
+  portENTER_CRITICAL(&heaterMux);
+  bool wasOn = heaterPinOn;
+  photoLightUntil = millis() + PHOTO_LIGHT_HOLD_MS;
+  applyHeaterPin();
+  bool nowOn = heaterPinOn;
+  portEXIT_CRITICAL(&heaterMux);
+  return (!wasOn && nowOn) ? PHOTO_LIGHT_WARMUP_MS : 0;
 }
 
 void updateThermostat() {
-  if (isnan(currentTemp) || currentTemp <= 0) {
-    digitalWrite(PIN_RELAY_HEATER, RELAY_OFF);
-    heaterState = false;
-    return;
-  }
+  float t = currentTemp;
+  bool h = heaterState;
+  if (!isfinite(t) || t <= 0)      h = false;
+  else if (lampMode == LAMP_ON)    h = true;
+  else if (lampMode == LAMP_OFF)   h = false;
+  else if (t < tempSetpointMin)    h = true;
+  else if (t >= tempSetpointMax)   h = false;
+  heaterState = h;
+  refreshHeaterPin();
+}
 
-  // Kontrol Pemanas Lampu (Mode Jarak Jauh: auto, on, off)
-  if (lampMode == "on") {
-    digitalWrite(PIN_RELAY_HEATER, RELAY_ON);
-    heaterState = true;
-  } else if (lampMode == "off") {
-    digitalWrite(PIN_RELAY_HEATER, RELAY_OFF);
-    heaterState = false;
-  } else {
-    // Mode Auto: Histeresis Suhu
-    if (currentTemp < tempSetpointMin) {
-      digitalWrite(PIN_RELAY_HEATER, RELAY_ON);
-      heaterState = true;
-    } else if (currentTemp >= tempSetpointMax) {
-      digitalWrite(PIN_RELAY_HEATER, RELAY_OFF);
-      heaterState = false;
-    }
-  }
-
-  // Kontrol Timer Pembalik Telur Terjadwal
-  unsigned long now = millis();
-  if (!isMotorRunning) {
-    if (motorIntervalMs > 0 && (now - lastMotorTurn >= motorIntervalMs)) {
-      triggerMotorTurn();
-    }
-  } else {
+// ─── MOTOR PEMBALIK TELUR ─────────────────────────────────────────────────────────
+void updateMotor(uint32_t now) {
+  if (isMotorRunning) {
     if (now - motorStartTime >= motorDurationMs) {
       digitalWrite(PIN_RELAY_MOTOR, RELAY_OFF);
       isMotorRunning = false;
       lastMotorTurn = now;
-      Serial.println("[MOTOR] Pembalik telur SELESAI berputar.");
+      Serial.println("[MOTOR] selesai");
     }
+    return;
+  }
+  if (motorRequest || now - lastMotorTurn >= motorIntervalMs) {
+    motorRequest = false;
+    digitalWrite(PIN_RELAY_MOTOR, RELAY_ON);
+    isMotorRunning = true;
+    motorStartTime = now;
+    Serial.println("[MOTOR] berputar");
   }
 }
 
-// ─── 5B. KONTROL JARAK JAUH VIA CLOUD API ───────────────────────────────────────────
-void applyCloudCommands(const String &json) {
-  if (json.indexOf("\"lampMode\":\"on\"") >= 0) lampMode = "on";
-  else if (json.indexOf("\"lampMode\":\"off\"") >= 0) lampMode = "off";
-  else if (json.indexOf("\"lampMode\":\"auto\"") >= 0) lampMode = "auto";
-
-  if (json.indexOf("\"motorManualRequest\":true") >= 0) {
-    triggerMotorTurn();
-  }
-
-  int idx = json.indexOf("\"tempMin\":");
-  if (idx >= 0) {
-    float v = json.substring(idx + 10).toFloat();
-    if (v >= 30.0f && v <= 45.0f) tempSetpointMin = v;
-  }
-
-  idx = json.indexOf("\"tempMax\":");
-  if (idx >= 0) {
-    float v = json.substring(idx + 10).toFloat();
-    if (v >= 30.0f && v <= 45.0f) tempSetpointMax = v;
-  }
-
-  idx = json.indexOf("\"motorIntervalHours\":");
-  if (idx >= 0) {
-    int v = json.substring(idx + 21).toInt();
-    if (v > 0 && v <= 24) motorIntervalMs = (unsigned long)v * 3600000UL;
-  }
-
-  idx = json.indexOf("\"motorDurationSeconds\":");
-  if (idx >= 0) {
-    int v = json.substring(idx + 23).toInt();
-    if (v > 0 && v <= 180) motorDurationMs = (unsigned long)v * 1000UL;
-  }
-}
-
-void pollCloudControl() {
-  if (WiFi.status() != WL_CONNECTED || uploadInProgress) return;
-
-  WiFiClientSecure sclient;
-  WiFiClient pclient;
-  HTTPClient http;
-
-  String controlUrl = String(SERVER_URL) + "/api/incubator/control";
-  if (useTls()) {
-    sclient.setInsecure();
-    http.begin(sclient, controlUrl);
-  } else {
-    http.begin(pclient, controlUrl);
-  }
-
-  http.setTimeout(4000);
-  int code = http.GET();
-  if (code == 200) {
-    String payload = http.getString();
-    applyCloudCommands(payload);
-  }
-  http.end();
-}
-
-// ─── 6. MANAJEMEN & TUNING KAMERA (OV2640 / OV3660) ─────────────────────────────────
+// ─── KAMERA (UXGA 1600x1200, FB TUNGGAL GRAB_WHEN_EMPTY = TANPA RESET AWB & TANPA GANGGUAN DMA) ──
 static camera_config_t makeConfig(framesize_t fs) {
   camera_config_t c = {};
   c.ledc_channel = LEDC_CHANNEL_0;
   c.ledc_timer   = LEDC_TIMER_0;
-  c.pin_d0       = Y2_GPIO_NUM;
-  c.pin_d1       = Y3_GPIO_NUM;
-  c.pin_d2       = Y4_GPIO_NUM;
-  c.pin_d3       = Y5_GPIO_NUM;
-  c.pin_d4       = Y6_GPIO_NUM;
-  c.pin_d5       = Y7_GPIO_NUM;
-  c.pin_d6       = Y8_GPIO_NUM;
-  c.pin_d7       = Y9_GPIO_NUM;
-  c.pin_xclk     = XCLK_GPIO_NUM;
-  c.pin_pclk     = PCLK_GPIO_NUM;
-  c.pin_vsync    = VSYNC_GPIO_NUM;
-  c.pin_href     = HREF_GPIO_NUM;
-  c.pin_sccb_sda = SIOD_GPIO_NUM;
-  c.pin_sccb_scl = SIOC_GPIO_NUM;
-  c.pin_pwdn     = PWDN_GPIO_NUM;
-  c.pin_reset    = RESET_GPIO_NUM;
+  c.pin_d0 = Y2_GPIO_NUM; c.pin_d1 = Y3_GPIO_NUM; c.pin_d2 = Y4_GPIO_NUM; c.pin_d3 = Y5_GPIO_NUM;
+  c.pin_d4 = Y6_GPIO_NUM; c.pin_d5 = Y7_GPIO_NUM; c.pin_d6 = Y8_GPIO_NUM; c.pin_d7 = Y9_GPIO_NUM;
+  c.pin_xclk = XCLK_GPIO_NUM; c.pin_pclk = PCLK_GPIO_NUM;
+  c.pin_vsync = VSYNC_GPIO_NUM; c.pin_href = HREF_GPIO_NUM;
+  c.pin_sccb_sda = SIOD_GPIO_NUM; c.pin_sccb_scl = SIOC_GPIO_NUM;
+  c.pin_pwdn = PWDN_GPIO_NUM; c.pin_reset = RESET_GPIO_NUM;
   c.xclk_freq_hz = 20000000;
   c.pixel_format = PIXFORMAT_JPEG;
-  c.grab_mode    = CAMERA_GRAB_LATEST;
-
-  if (psramFound()) {
-    c.frame_size   = fs;
-    c.jpeg_quality = JPEG_QUALITY;
-    c.fb_count     = 2;
-    c.fb_location  = CAMERA_FB_IN_PSRAM;
-  } else {
-    c.frame_size   = FRAMESIZE_SVGA;
-    c.jpeg_quality = 12;
-    c.fb_count     = 1;
-    c.fb_location  = CAMERA_FB_IN_DRAM;
-  }
+  // GRAB_WHEN_EMPTY + fb_count=1: DMA berhenti otomatis saat tidak memotret (WiFi kencang),
+  // tapi sensor tetap hidup sehingga Auto White Balance (AWB) tidak pernah reset jadi hijau.
+  c.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
+  bool psram = psramFound();
+  c.frame_size   = psram ? fs : FRAMESIZE_SVGA;
+  c.jpeg_quality = psram ? JPEG_QUALITY : 12;
+  c.fb_count     = 1;
+  c.fb_location  = psram ? CAMERA_FB_IN_PSRAM : CAMERA_FB_IN_DRAM;
   return c;
 }
 
 void tuneSensor() {
   sensor_t *s = esp_camera_sensor_get();
   if (!s) return;
-
   s->set_whitebal(s, 1);
   s->set_awb_gain(s, 1);
-  s->set_wb_mode(s, 0);
+  s->set_wb_mode(s, 0);               // Auto White Balance
+  s->set_exposure_ctrl(s, 1);
+  s->set_aec2(s, 0);                  // Matikan DSP aec2 (penyebab bayangan terangkat jadi hijau)
+  s->set_ae_level(s, 0);              // Level eksposur netral agar hitam tetap hitam pekat
+  s->set_gain_ctrl(s, 1);
+  s->set_gainceiling(s, GAINCEILING_2X); // Batasi gain 2X (menghilangkan noise & garis hijau)
   s->set_bpc(s, 1);
   s->set_wpc(s, 1);
   s->set_raw_gma(s, 1);
   s->set_lenc(s, 1);
-  s->set_gainceiling(s, GAINCEILING_2X);
-  s->set_brightness(s, 1);  // Optimal untuk interior inkubator
-  s->set_contrast(s, 1);
-  s->set_saturation(s, 0);
-
-  // Penyesuaian khusus OV3660 vs OV2640
-  if (s->id.PID == OV3660_PID) {
-    s->set_vflip(s, 1);
-    s->set_saturation(s, -1);
-  } else {
-    s->set_vflip(s, 1); // Balik vertikal untuk penempatan kamera overhead di atap
-  }
-}
-
-// Inisialisasi kamera on-demand resolusi maksimal: QXGA (OV3660) -> UXGA (OV2640) -> SXGA
-bool initCamera() {
-  if (!psramFound()) {
-    camera_config_t c = makeConfig(FRAMESIZE_SVGA);
-    if (esp_camera_init(&c) == ESP_OK) {
-      tuneSensor();
-      return true;
-    }
-    return false;
-  }
-
-  // Coba urutan resolusi tertinggi yang didukung sensor
-  camera_config_t c = makeConfig(FRAMESIZE_QXGA);
-  if (esp_camera_init(&c) == ESP_OK) {
-    tuneSensor();
-    return true;
-  }
-
-  esp_camera_deinit();
-  c = makeConfig(FRAMESIZE_UXGA);
-  if (esp_camera_init(&c) == ESP_OK) {
-    tuneSensor();
-    return true;
-  }
-
-  esp_camera_deinit();
-  c = makeConfig(FRAMESIZE_SXGA);
-  if (esp_camera_init(&c) == ESP_OK) {
-    tuneSensor();
-    return true;
-  }
-
-  return false;
+  s->set_brightness(s, 0);            // 0 = warna natural (1 membuat gelap jadi abu-hijau)
+  s->set_contrast(s, 0);
+  s->set_saturation(s, s->id.PID == OV3660_PID ? -1 : 0);
+  s->set_sharpness(s, 2);             // Ketajaman maksimal
+  s->set_vflip(s, 1);
 }
 
 bool camStart() {
   if (camUp) return true;
-  camUp = initCamera();
-  return camUp;
+  const framesize_t sizes[] = {FRAMESIZE_UXGA, FRAMESIZE_SXGA, FRAMESIZE_XGA, FRAMESIZE_SVGA};
+  for (framesize_t fs : sizes) {
+    camera_config_t c = makeConfig(fs);
+    if (esp_camera_init(&c) == ESP_OK) {
+      tuneSensor();
+      // Buang beberapa frame saat start agar AWB selesai kalibrasi dari hijau ke warna normal
+      for (int i = 0; i < 4; i++) {
+        delay(80);
+        camera_fb_t *fb = esp_camera_fb_get();
+        if (fb) esp_camera_fb_return(fb);
+      }
+      Serial.printf("[CAM] siap di framesize=%d quality=%d\n", (int)fs, (int)c.jpeg_quality);
+      return camUp = true;
+    }
+    esp_camera_deinit();
+  }
+  return false;
 }
 
 void camStop() {
@@ -361,593 +293,505 @@ void camStop() {
   camUp = false;
 }
 
-// Verifikasi integritas marker JPEG (SOI FF D8 & EOI FF D9)
-static bool jpegValid(camera_fb_t *fb) {
-  if (!fb || fb->format != PIXFORMAT_JPEG || fb->len < 1000) {
-    return false;
-  }
-  return fb->buf[0] == 0xFF && fb->buf[1] == 0xD8 &&
+static bool jpegValid(const camera_fb_t *fb) {
+  return fb && fb->format == PIXFORMAT_JPEG && fb->len >= 1000 &&
+         fb->buf[0] == 0xFF && fb->buf[1] == 0xD8 &&
          fb->buf[fb->len - 2] == 0xFF && fb->buf[fb->len - 1] == 0xD9;
 }
 
-// ─── 7. FUNGSI BACKGROUND CAPTURE & UPLOAD KE CLOUD ─────────────────────────────────
-bool captureAndUploadFrame() {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("[UPLOAD] Dibatalkan: WiFi tidak terhubung.");
-    return false;
+static bool saveToBuffer(PhotoBuffer &dst, const uint8_t *src, size_t len) {
+  if (len > dst.cap) {
+    if (dst.buf) free(dst.buf);
+    dst.cap = max(len + 16384U, (size_t)163840U);
+    dst.buf = (uint8_t *)(psramFound() ? ps_malloc(dst.cap) : malloc(dst.cap));
+    if (!dst.buf) {
+      dst.cap = 0;
+      dst.len = 0;
+      return false;
+    }
   }
+  memcpy(dst.buf, src, len);
+  dst.len = len;
+  return true;
+}
 
-  // Ambil camera mutex dengan timeout 3 detik
-  if (xSemaphoreTake(cameraMutex, pdMS_TO_TICKS(3000)) != pdTRUE) {
-    Serial.println("[UPLOAD] Kamera sedang dipakai handler lain.");
-    return false;
-  }
+// Ambil foto UXGA ke buffer tujuan. Sensor tetap hidup (AWB tetap akurat/tidak hijau),
+// dan dengan fb_count=1 + GRAB_WHEN_EMPTY, DMA langsung berhenti setelah frame diambil.
+bool capturePhotoTo(PhotoBuffer &target) {
+  if (xSemaphoreTake(cameraMutex, pdMS_TO_TICKS(5000)) != pdTRUE) return false;
 
-  // Nyalakan LED Flash jika diaktifkan
-  bool ledTurnedOnHere = false;
-  if (flashLedAuto && !manualLedState) {
-    setFlashLed(true);
-    ledTurnedOnHere = true;
-    delay(100); // Settle exposure sensor
-  }
-
+  uint32_t warmup = requestPhotoLight();
   if (!camStart()) {
-    Serial.println("[UPLOAD] Gagal menyalakan modul kamera.");
-    if (ledTurnedOnHere) setFlashLed(false);
     xSemaphoreGive(cameraMutex);
     return false;
   }
 
-  camera_fb_t *fb = NULL;
-  int tries = 0;
+  if (warmup) delay(warmup);
 
-  while (!fb && tries < MAX_TRIES) {
-    tries++;
-    // Buang frame pemanasan sensor agar eksposur dan AGC stabil
-    camera_fb_t *dummy = esp_camera_fb_get();
-    if (dummy) esp_camera_fb_return(dummy);
+  bool ok = false;
+  int qUsed = JPEG_QUALITY;
+  for (int t = 0; t < CAPTURE_TRIES; t++) {
+    // Buang 1 frame lama di buffer tunggal (dan 1 frame lagi jika lampu baru menyala)
+    int flushCount = (warmup && t == 0) ? 2 : 1;
+    for (int i = 0; i < flushCount; i++) {
+      camera_fb_t *old = esp_camera_fb_get();
+      if (old) esp_camera_fb_return(old);
+      if (warmup) delay(60);
+    }
 
-    camera_fb_t *temp = esp_camera_fb_get();
-    if (jpegValid(temp)) {
-      fb = temp;
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (jpegValid(fb)) {
+      ok = saveToBuffer(target, fb->buf, fb->len);
+      esp_camera_fb_return(fb);
       break;
     }
-    if (temp) esp_camera_fb_return(temp);
-    Serial.printf("[UPLOAD] Percobaan frame %d gagal, mengulang...\n", tries);
-    delay(80);
+    if (fb) esp_camera_fb_return(fb);
+    qUsed = min(qUsed + 2, 12);
+    sensor_t *s = esp_camera_sensor_get();
+    if (s) s->set_quality(s, qUsed);
+    delay(60);
+  }
+  if (qUsed != JPEG_QUALITY) {
+    sensor_t *s = esp_camera_sensor_get();
+    if (s) s->set_quality(s, JPEG_QUALITY);
   }
 
-  // Matikan LED Flash yang tadi dinyalakan
-  if (ledTurnedOnHere && !manualLedState) {
-    setFlashLed(false);
-  }
-
-  if (!fb) {
-    Serial.println("[UPLOAD] Gagal mendapatkan frame valid dari sensor.");
+  if (!ok) {
+    // Reset hanya jika sensor gagal memberi frame valid
     camStop();
-    xSemaphoreGive(cameraMutex);
-    return false;
   }
-
-  // Salin frame ke buffer RAM/PSRAM
-  size_t len = fb->len;
-  uint8_t *buffer = NULL;
-  if (psramFound()) {
-    buffer = (uint8_t*) ps_malloc(len);
-  } else {
-    buffer = (uint8_t*) malloc(len);
-  }
-
-  if (!buffer) {
-    Serial.println("[UPLOAD] Gagal mengalokasikan buffer memory untuk frame.");
-    esp_camera_fb_return(fb);
-    camStop();
-    xSemaphoreGive(cameraMutex);
-    return false;
-  }
-
-  memcpy(buffer, fb->buf, len);
-  esp_camera_fb_return(fb);
-
-  // Matikan kamera sebelum upload agar radio WiFi 2.4GHz bebas interferensi & daya stabil
-  camStop();
   xSemaphoreGive(cameraMutex);
+  return ok;
+}
 
-  // Kirim data via HTTP/HTTPS POST
+// ─── PARSER JSON RINGAN ───────────────────────────────────────────────────────────
+static const char *jsonValue(const String &json, const char *key) {
+  char pat[40];
+  snprintf(pat, sizeof(pat), "\"%s\":", key);
+  int i = json.indexOf(pat);
+  return i < 0 ? nullptr : json.c_str() + i + strlen(pat);
+}
+
+static bool jsonNumber(const String &json, const char *key, float &out) {
+  const char *p = jsonValue(json, key);
+  if (!p || *p == 'n') return false;
+  out = strtof(p, nullptr);
+  return true;
+}
+
+void applyCloudCommands(const String &json) {
+  if (const char *p = jsonValue(json, "lampMode")) {
+    if      (!strncmp(p, "\"on\"", 4))   lampMode = LAMP_ON;
+    else if (!strncmp(p, "\"off\"", 5))  lampMode = LAMP_OFF;
+    else if (!strncmp(p, "\"auto\"", 6)) lampMode = LAMP_AUTO;
+  }
+
+  const char *req = jsonValue(json, "motorManualRequest");
+  const char *cmd = jsonValue(json, "motorCommandId");
+  if (req && !strncmp(req, "true", 4) && cmd && *cmd == '"') {
+    char id[sizeof(lastMotorCommandId)] = "";
+    const char *end = strchr(cmd + 1, '"');
+    size_t n = end ? (size_t)(end - cmd - 1) : 0;
+    if (n > 0 && n < sizeof(id)) {
+      memcpy(id, cmd + 1, n);
+      id[n] = '\0';
+      if (strcmp(id, lastMotorCommandId) != 0) {
+        Preferences prefs;
+        if (prefs.begin("incubator", false)) {
+          prefs.putString("lastMotorCmd", id);
+          prefs.end();
+        }
+        strcpy(lastMotorCommandId, id);
+        motorRequest = true;
+      }
+    }
+  }
+
+  float v;
+  if (jsonNumber(json, "tempMin", v) && v >= 30 && v <= 45) tempSetpointMin = v;
+  if (jsonNumber(json, "tempMax", v) && v >= 30 && v <= 45) tempSetpointMax = v;
+  if (jsonNumber(json, "motorIntervalHours", v) && v >= 1 && v <= 24) motorIntervalMs = (uint32_t)v * 3600000UL;
+  if (jsonNumber(json, "motorDurationSeconds", v) && v >= 1 && v <= 180) motorDurationMs = (uint32_t)v * 1000UL;
+  if (jsonNumber(json, "captureIntervalSeconds", v)) {
+    uint32_t s = constrain((uint32_t)v, UPLOAD_MIN_S, UPLOAD_MAX_S);
+    uploadIntervalMs = s * 1000UL;
+    if (s != storedUploadSeconds) {
+      Preferences prefs;
+      if (prefs.begin("incubator", false)) {
+        prefs.putUInt("photoSeconds", s);
+        prefs.end();
+        storedUploadSeconds = s;
+      }
+    }
+  }
+}
+
+// ─── CLOUD (Core 0, tidak pernah memblokir web lokal) ────────────────────────────
+void cloudUpload() {
+  uint32_t t0 = millis();
+  if (!capturePhotoTo(cloudPhoto) || !cloudPhoto.buf || cloudPhoto.len == 0) {
+    Serial.println("[UPLOAD] gagal ambil frame");
+    return;
+  }
+  uint32_t captureMs = millis() - t0;
+
+  // Batalkan upload jika user baru saja menekan tombol di web lokal
+  if ((int32_t)(localWebBusyUntil - millis()) > 0) return;
+
   WiFiClientSecure sclient;
-  WiFiClient pclient;
-  HTTPClient http;
-
-  String fullUrl = String(SERVER_URL) + UPLOAD_ENDPOINT;
+  WiFiClient       pclient;
+  HTTPClient       http;
+  String url = String(SERVER_URL) + "/api/incubator/upload";
 
   if (useTls()) {
-    sclient.setInsecure(); // Mengabaikan validasi root CA untuk efisiensi RAM ESP32
-    http.begin(sclient, fullUrl);
+    sclient.setInsecure();
+    sclient.setTimeout(12);
+    http.begin(sclient, url);
   } else {
-    http.begin(pclient, fullUrl);
+    http.begin(pclient, url);
   }
 
   http.setTimeout(15000);
-  http.addHeader("Content-Type", "image/jpeg");
   http.addHeader("X-Device-Key", DEVICE_KEY);
+  http.addHeader("Content-Type", "image/jpeg");
   http.addHeader("X-RSSI", String(WiFi.RSSI()));
-  http.addHeader("X-Temp", String(currentTemp, 1));
-  http.addHeader("X-Humidity", String(currentHum, 1));
+  float t = currentTemp, h = currentHum;
+  if (isfinite(t) && t > 0) http.addHeader("X-Temp", String(t, 1));
+  else                      http.addHeader("X-Temp-Valid", "0");
+  if (isfinite(h))          http.addHeader("X-Humidity", String(h, 1));
+  else                      http.addHeader("X-Humidity-Valid", "0");
   http.addHeader("X-Lamp", heaterState ? "1" : "0");
   http.addHeader("X-Motor", isMotorRunning ? "1" : "0");
 
-  unsigned long tStart = millis();
-  int code = http.POST(buffer, len);
-  unsigned long duration = millis() - tStart;
+  uint32_t t1 = millis();
+  int code = http.POST(cloudPhoto.buf, cloudPhoto.len);
+  uint32_t sendMs = millis() - t1;
 
-  if (code == 200 || code == 201) {
-    String resp = http.getString();
-    applyCloudCommands(resp);
-  }
+  if (code == 200 || code == 201) applyCloudCommands(http.getString());
   http.end();
-
-  free(buffer);
 
   lastUploadCode  = code;
   lastUploadTime  = millis();
-  lastUploadBytes = len;
-
-  Serial.printf("[UPLOAD] Selesai: HTTP %d | Ukuran: %u KB | Waktu: %lu ms\n",
-                code, (unsigned)(len / 1024), duration);
-
-  return (code == 200 || code == 201);
+  lastUploadBytes = cloudPhoto.len;
+  Serial.printf("[UPLOAD] HTTP %d | %u KB | foto %lu ms | kirim %lu ms\n",
+                code, (unsigned)(cloudPhoto.len / 1024), captureMs, sendMs);
 }
 
-// FreeRTOS Background Task untuk upload non-blocking
-void uploadWorkerTask(void *pvParameters) {
-  for (;;) {
-    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-    uploadInProgress = true;
-    captureAndUploadFrame();
-    uploadInProgress = false;
-  }
-}
+void cloudPoll() {
+  WiFiClientSecure sclient;
+  WiFiClient       pclient;
+  HTTPClient       http;
+  String url = String(SERVER_URL) + "/api/incubator/device-control";
+  if (lastMotorCommandId[0]) url += String("?motorAck=") + lastMotorCommandId;
 
-// ─── 8. HANDLER LOCAL WEB SERVER ───────────────────────────────────────────────────
-
-// Endpoint: GET / (Dashboard Kontrol & Debugging Langsung dari Browser)
-void handleRoot() {
-  unsigned long timeSinceLastTurn = millis() - lastMotorTurn;
-  long secLeft = (motorIntervalMs > timeSinceLastTurn) ? (motorIntervalMs - timeSinceLastTurn) / 1000 : 0;
-  long uploadAgoSec = (lastUploadTime > 0) ? (millis() - lastUploadTime) / 1000 : -1;
-
-  String html = F("<!DOCTYPE html><html lang='id'><head><meta charset='utf-8'>"
-    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-    "<title>ESP32-CAM Inkubator</title>"
-    "<style>"
-    ":root{--bg:#0f172a;--card:#1e293b;--text:#f8fafc;--text-dim:#94a3b8;--primary:#38bdf8;--accent:#22c55e;--danger:#ef4444;--border:#334155;}"
-    "*{box-sizing:border-box;margin:0;padding:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;}"
-    "body{background:var(--bg);color:var(--text);padding:16px;max-width:800px;margin:0 auto;line-height:1.5;}"
-    "header{padding-bottom:16px;border-bottom:1px solid var(--border);margin-bottom:20px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;}"
-    "h1{font-size:1.4rem;color:var(--primary);font-weight:700;}"
-    ".badge{background:var(--border);padding:4px 10px;border-radius:99px;font-size:0.8rem;color:var(--text-dim);}"
-    ".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;margin-bottom:20px;}"
-    ".card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:16px;}"
-    ".card h3{font-size:0.85rem;text-transform:uppercase;color:var(--text-dim);margin-bottom:8px;letter-spacing:0.05em;}"
-    ".metric{font-size:1.8rem;font-weight:700;color:var(--text);}"
-    ".sub{font-size:0.8rem;color:var(--text-dim);margin-top:4px;}"
-    ".btn-group{display:flex;flex-wrap:wrap;gap:10px;margin-bottom:20px;}"
-    ".btn{background:var(--card);border:1px solid var(--border);color:var(--text);padding:10px 18px;border-radius:8px;font-size:0.9rem;font-weight:600;cursor:pointer;text-decoration:none;display:inline-flex;align-items:center;gap:6px;transition:0.2s;}"
-    ".btn:hover{background:var(--border);border-color:var(--primary);}"
-    ".btn-primary{background:#0284c7;border-color:#0284c7;color:#fff;}"
-    ".btn-primary:hover{background:#0369a1;}"
-    ".btn-danger{background:#dc2626;border-color:#dc2626;color:#fff;}"
-    ".preview-box{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:16px;text-align:center;}"
-    ".preview-img{max-width:100%;height:auto;border-radius:6px;background:#000;margin-top:12px;border:1px solid var(--border);min-height:180px;display:block;margin-left:auto;margin-right:auto;}"
-    ".status-on{color:var(--accent);font-weight:700;}.status-off{color:var(--text-dim);}"
-    "</style></head><body>"
-    "<header>"
-    "<div><h1>ESP32-CAM Incubator</h1><p class='sub'>Sistem Kontrol & Monitoring Penetas Telur</p></div>"
-    "<div><span class='badge'>IP: ");
-  html += WiFi.localIP().toString();
-  html += F("</span> <span class='badge'>RSSI: ");
-  html += String(WiFi.RSSI());
-  html += F(" dBm</span></div></header>"
-    "<div class='grid'>"
-    "<div class='card'><h3>Suhu Lingkungan</h3><div class='metric'>");
-  html += String(currentTemp, 1);
-  html += F("&deg;C</div><div class='sub'>Setpoint: ");
-  html += String(tempSetpointMin, 1);
-  html += F(" - ");
-  html += String(tempSetpointMax, 1);
-  html += F("&deg;C</div></div>"
-    "<div class='card'><h3>Kelembaban</h3><div class='metric'>");
-  html += String((int)currentHum);
-  html += F("%</div><div class='sub'>Sensor DHT22 Real-time</div></div>"
-    "<div class='card'><h3>Status Aktuator</h3>"
-    "<div>Pemanas: <span class='");
-  html += heaterState ? F("status-on'>MENYALA (ON)") : F("status-off'>MATI (OFF)");
-  html += F("</span></div><div>Kipas: <span class='");
-  html += fanState ? F("status-on'>MENYALA (ON)") : F("status-off'>STANDBY (OFF)");
-  html += F("</span></div><div>Dinamo: <span class='");
-  html += isMotorRunning ? F("status-on'>BERPUTAR") : F("status-off'>STANDBY");
-  html += F("</span></div></div>"
-    "<div class='card'><h3>Cloud Auto-Upload</h3><div class='metric'>");
-  html += (lastUploadCode > 0) ? ("HTTP " + String(lastUploadCode)) : "Belum Ada";
-  html += F("</div><div class='sub'>Interval: 20s | ");
-  if (uploadAgoSec >= 0) {
-    html += String(uploadAgoSec) + "s lalu (" + String((unsigned)(lastUploadBytes / 1024)) + " KB)";
+  if (useTls()) {
+    sclient.setInsecure();
+    sclient.setTimeout(5);
+    http.begin(sclient, url);
   } else {
-    html += F("Menunggu upload");
+    http.begin(pclient, url);
   }
-  html += F("</div></div></div>"
-    "<div class='btn-group'>"
-    "<a class='btn btn-primary' href='/capture' target='_blank'>Ambil Foto Snapshot (/capture)</a>"
-    "<button class='btn' onclick='toggleLed()'>Toggle LED Flash (/led)</button>"
-    "<button class='btn' onclick='turnMotor()'>Putar Motor Manual (/turn)</button>"
-    "<a class='btn' href='/status' target='_blank'>JSON Status (/status)</a>"
-    "<button class='btn' onclick='location.reload()'>Refresh Dashboard</button>"
-    "</div>"
-    "<div class='preview-box'>"
-    "<h3>Live Snapshot Preview</h3>"
-    "<p class='sub'>Klik tombol di bawah untuk memperbarui gambar kamera di atap inkubator</p>"
-    "<div style='margin-top:10px;'><button class='btn btn-primary' onclick='refreshImage()'>Perbarui Snapshot</button></div>"
-    "<img id='cam' class='preview-img' src='/capture' alt='Preview Kamera'>"
-    "</div>"
-    "<script>"
-    "function refreshImage(){document.getElementById('cam').src='/capture?t='+new Date().getTime();}"
-    "function toggleLed(){fetch('/led').then(r=>r.json()).then(d=>alert('Status LED Flash: '+(d.led?'MENYALA':'MATI')));}"
-    "function turnMotor(){if(confirm('Picu putaran motor pembalik telur sekarang?')){fetch('/turn').then(r=>r.text()).then(t=>alert(t));}}"
-    "</script></body></html>");
 
+  http.setTimeout(4000);
+  http.addHeader("X-Device-Key", DEVICE_KEY);
+  if (http.GET() == 200) applyCloudCommands(http.getString());
+  http.end();
+}
+
+void cloudTask(void *) {
+  // Tarik pengaturan interval & mode lampu dari web terlebih dahulu saat boot
+  if (WiFi.status() == WL_CONNECTED) {
+    cloudPoll();
+  }
+  uint32_t lastPoll = millis();
+  uint32_t lastUp = millis() - uploadIntervalMs + 8000UL;  // foto pertama 8 s setelah boot, lalu ikut interval web
+
+  for (;;) {
+    uint32_t now = millis();
+    bool localBusy = (int32_t)(localWebBusyUntil - now) > 0;
+    if (!localBusy && WiFi.status() == WL_CONNECTED) {
+      if (now - lastUp >= uploadIntervalMs) {
+        lastUp = now;
+        cloudUpload();
+        lastPoll = millis();
+      } else if (now - lastPoll >= CONTROL_POLL_MS) {
+        lastPoll = now;
+        cloudPoll();
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+}
+
+// ─── WEB SERVER LOKAL (Core 1) ────────────────────────────────────────────────────
+static int32_t secondsUntilTurn() {
+  uint32_t passed = millis() - lastMotorTurn;
+  return motorIntervalMs > passed ? (motorIntervalMs - passed) / 1000 : 0;
+}
+
+static int32_t secondsSinceUpload() {
+  return lastUploadTime ? (millis() - lastUploadTime) / 1000 : -1;
+}
+
+void handleRoot() {
+  localWebBusyUntil = millis() + 8000UL;
+  float t = currentTemp, h = currentHum;
+  char buf[640];
+  snprintf(buf, sizeof(buf),
+    "<div class=g>"
+    "<div class=c><h3>Suhu</h3><b id=st>%s&deg;C</b><p>Setpoint %.1f - %.1f&deg;C</p></div>"
+    "<div class=c><h3>Kelembaban</h3><b id=sh>%s%%</b><p>DHT22</p></div>"
+    "<div class=c><h3>Aktuator</h3><p id=sa>Lampu: %s (%s)</p><p id=sm>Dinamo: %s</p><p>Putar lagi: %ld menit</p></div>"
+    "<div class=c><h3>Upload Cloud</h3><b id=su>%d</b><p>Tiap %lu s | %ld s lalu | %lu KB</p></div>"
+    "</div>",
+    isfinite(t) ? String(t, 1).c_str() : "--", (float)tempSetpointMin, (float)tempSetpointMax,
+    isfinite(h) ? String((int)h).c_str() : "--",
+    heaterPinOn ? "MENYALA" : "MATI", LAMP_MODE_NAME[lampMode],
+    isMotorRunning ? "BERPUTAR" : "STANDBY", (long)(secondsUntilTurn() / 60),
+    lastUploadCode, (unsigned long)(uploadIntervalMs / 1000), (long)secondsSinceUpload(),
+    (unsigned long)(lastUploadBytes / 1024));
+
+  String html;
+  html.reserve(2500);
+  html += F("<!DOCTYPE html><html lang=id><head><meta charset=utf-8>"
+            "<meta name=viewport content='width=device-width,initial-scale=1'><title>Inkubator</title><style>"
+            "body{background:#0f172a;color:#f8fafc;font-family:system-ui,sans-serif;max-width:960px;margin:0 auto;padding:16px}"
+            ".g{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin:16px 0}"
+            ".c{background:#1e293b;border:1px solid #334155;border-radius:10px;padding:14px}"
+            "h3{margin:0 0 6px;font-size:.8rem;color:#94a3b8;text-transform:uppercase}b{font-size:1.6rem}p{margin:4px 0;color:#cbd5e1}"
+            "button{background:#0284c7;color:#fff;border:0;border-radius:8px;padding:12px 16px;margin:4px;font-weight:600;min-height:44px;cursor:pointer}"
+            "button:disabled{opacity:.5;cursor:wait}"
+            "button:focus-visible{outline:2px solid #38bdf8;outline-offset:2px}"
+            "#info{color:#38bdf8;font-size:.9rem;margin:8px 4px}"
+            "img{width:100%;border-radius:8px;background:#000;min-height:200px;margin-top:8px;display:block}"
+            "</style></head><body><h1>Inkubator ESP32-CAM</h1><p>IP ");
+  html += WiFi.localIP().toString();
+  html += F(" | RSSI ");
+  html += WiFi.RSSI();
+  html += F(" dBm | UXGA 1600x1200</p>");
+  html += buf;
+  html += F("<button id=btn onclick=snap()>Ambil Foto (1600x1200)</button>"
+            "<button onclick=\"if(confirm('Putar dinamo sekarang?'))fetch('/turn').then(r=>r.text()).then(alert)\">Putar Dinamo</button>"
+            "<button onclick=location.reload()>Muat Ulang</button>"
+            "<div id=info>Klik Ambil Foto untuk memotret resolusi penuh.</div>"
+            "<img id=cam alt='Foto kamera inkubator'>"
+            "<script>"
+            "let t0=0;"
+            "function snap(){"
+            "btn.disabled=true;t0=performance.now();"
+            "info.textContent='Memotret UXGA 1600x1200...';"
+            "cam.src='/capture?t='+Date.now();"
+            "}"
+            "cam.onload=()=>{btn.disabled=false;info.textContent='Selesai dalam '+((performance.now()-t0)/1000).toFixed(2)+' detik ('+cam.naturalWidth+'x'+cam.naturalHeight+')'};"
+            "cam.onerror=()=>{btn.disabled=false;info.textContent='Gagal memuat foto, coba lagi.'};"
+            "setInterval(()=>fetch('/status').then(r=>r.json()).then(d=>{"
+            "if(d.temperature!==null)st.innerHTML=d.temperature.toFixed(1)+'&deg;C';"
+            "if(d.humidity!==null)sh.textContent=Math.round(d.humidity)+'%';"
+            "sa.textContent='Lampu: '+(d.heater?'MENYALA':'MATI')+' ('+d.lamp_mode+')';"
+            "sm.textContent='Dinamo: '+(d.motor_running?'BERPUTAR':'STANDBY');"
+            "su.textContent=d.last_upload_code;"
+            "}).catch(()=>{}),4000);"
+            "</script></body></html>");
   server.send(200, "text/html", html);
 }
 
-// Endpoint: GET /capture (Mengambil snapshot JPEG tunggal)
 void handleCapture() {
-  if (xSemaphoreTake(cameraMutex, pdMS_TO_TICKS(3500)) != pdTRUE) {
-    server.send(503, "text/plain", "Kamera sibuk: proses upload latar belakang sedang berlangsung.");
+  localWebBusyUntil = millis() + 8000UL;
+  uint32_t t0 = millis();
+  if (!capturePhotoTo(localPhoto) || !localPhoto.buf || localPhoto.len == 0) {
+    server.send(500, "text/plain", "Gagal mengambil frame");
     return;
   }
+  uint32_t capMs = millis() - t0;
 
-  bool ledActive = false;
-  if (flashLedAuto && !manualLedState) {
-    setFlashLed(true);
-    ledActive = true;
-    delay(100);
-  }
-
-  if (!camStart()) {
-    if (ledActive) setFlashLed(false);
-    xSemaphoreGive(cameraMutex);
-    server.send(500, "text/plain", "Gagal inisialisasi modul kamera!");
-    return;
-  }
-
-  // Buang frame lama
-  camera_fb_t *dummy = esp_camera_fb_get();
-  if (dummy) esp_camera_fb_return(dummy);
-
-  camera_fb_t *fb = esp_camera_fb_get();
-
-  if (ledActive && !manualLedState) {
-    setFlashLed(false);
-  }
-
-  if (!fb || !jpegValid(fb)) {
-    if (fb) esp_camera_fb_return(fb);
-    camStop();
-    xSemaphoreGive(cameraMutex);
-    server.send(500, "text/plain", "Gagal mengambil frame valid dari sensor!");
-    return;
-  }
-
-  server.sendHeader("Content-Disposition", "inline; filename=incubator_snapshot.jpg");
   server.sendHeader("Access-Control-Allow-Origin", "*");
-  server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
-  server.setContentLength(fb->len);
+  server.sendHeader("Cache-Control", "no-store");
+  server.setContentLength(localPhoto.len);
   server.send(200, "image/jpeg", "");
+  server.setContentLength(CONTENT_LENGTH_NOT_SET);
 
-  WiFiClient client = server.client();
-  client.write(fb->buf, fb->len);
-
-  esp_camera_fb_return(fb);
-  camStop(); // Matikan kamera untuk menghemat daya dan mendinginkan sensor
-  xSemaphoreGive(cameraMutex);
-}
-
-// Endpoint: GET /led (Kontrol Lampu Flash AI-Thinker)
-void handleLed() {
-  if (server.hasArg("state")) {
-    manualLedState = (server.arg("state").toInt() > 0);
-  } else if (server.hasArg("auto")) {
-    flashLedAuto = (server.arg("auto").toInt() > 0);
-  } else {
-    manualLedState = !manualLedState; // Toggle
+  NetworkClient client = server.client();
+  client.setNoDelay(true);
+  client.setTimeout(10000);
+  uint32_t t1 = millis();
+  size_t sent = 0;
+  while (sent < localPhoto.len && client.connected()) {
+    size_t chunk = min((size_t)8192, localPhoto.len - sent);
+    size_t n = client.write(localPhoto.buf + sent, chunk);
+    if (n == 0) break;
+    sent += n;
   }
+  delay(20);
+  uint32_t sendMs = millis() - t1;
 
-  setFlashLed(manualLedState);
-
-  String json = "{";
-  json += "\"status\":\"ok\",";
-  json += "\"led\":" + String(manualLedState ? "true" : "false") + ",";
-  json += "\"auto_flash\":" + String(flashLedAuto ? "true" : "false");
-  json += "}";
-
-  server.sendHeader("Access-Control-Allow-Origin", "*");
-  server.send(200, "application/json", json);
+  Serial.printf("[LOCAL CAP] %u/%u KB | foto %lu ms | kirim %lu ms\n",
+                (unsigned)(sent / 1024), (unsigned)(localPhoto.len / 1024), capMs, sendMs);
 }
 
-// Endpoint: GET /status (JSON Status Lengkap Sensor & Aktuator)
 void handleStatus() {
-  unsigned long timeSinceLastTurn = millis() - lastMotorTurn;
-  long nextTurnInSec = (motorIntervalMs > timeSinceLastTurn) ? (motorIntervalMs - timeSinceLastTurn) / 1000 : 0;
-  long lastUploadAgo = (lastUploadTime > 0) ? (millis() - lastUploadTime) / 1000 : -1;
-
-  String json = "{";
-  json += "\"temperature\":" + String(currentTemp, 2) + ",";
-  json += "\"humidity\":" + String(currentHum, 1) + ",";
-  json += "\"heater\":" + String(heaterState ? "true" : "false") + ",";
-  json += "\"fan\":" + String(fanState ? "true" : "false") + ",";
-  json += "\"motor_running\":" + String(isMotorRunning ? "true" : "false") + ",";
-  json += "\"next_turn_sec\":" + String(nextTurnInSec) + ",";
-  json += "\"led_manual\":" + String(manualLedState ? "true" : "false") + ",";
-  json += "\"led_auto\":" + String(flashLedAuto ? "true" : "false") + ",";
-  json += "\"auto_upload_interval_sec\":" + String(AUTO_UPLOAD_INTERVAL / 1000) + ",";
-  json += "\"last_upload_code\":" + String(lastUploadCode) + ",";
-  json += "\"last_upload_ago_sec\":" + String(lastUploadAgo) + ",";
-  json += "\"rssi\":" + String(WiFi.RSSI()) + ",";
-  json += "\"ip\":\"" + WiFi.localIP().toString() + "\"";
-  json += "}";
-
+  localWebBusyUntil = millis() + 6000UL;  // selama halaman lokal dibuka, tunda upload cloud
+  float t = currentTemp, h = currentHum;
+  char json[480];
+  snprintf(json, sizeof(json),
+    "{\"temperature\":%s,\"humidity\":%s,\"heater\":%s,\"lamp_mode\":\"%s\","
+    "\"motor_running\":%s,\"next_turn_sec\":%ld,\"auto_upload_interval_sec\":%lu,"
+    "\"last_upload_code\":%d,\"last_upload_ago_sec\":%ld,\"rssi\":%d,\"ip\":\"%s\"}",
+    isfinite(t) ? String(t, 2).c_str() : "null", isfinite(h) ? String(h, 1).c_str() : "null",
+    heaterPinOn ? "true" : "false", LAMP_MODE_NAME[lampMode],
+    isMotorRunning ? "true" : "false", (long)secondsUntilTurn(),
+    (unsigned long)(uploadIntervalMs / 1000), lastUploadCode, (long)secondsSinceUpload(),
+    WiFi.RSSI(), WiFi.localIP().toString().c_str());
   server.sendHeader("Access-Control-Allow-Origin", "*");
   server.send(200, "application/json", json);
 }
 
-// Endpoint: GET /turn (Pemicu Motor Pembalik Telur Manual)
-void handleManualTurn() {
-  triggerMotorTurn();
+void handleTurn() {
+  localWebBusyUntil = millis() + 6000UL;
+  motorRequest = true;
   server.sendHeader("Access-Control-Allow-Origin", "*");
-  server.send(200, "text/plain", "Motor pembalik telur aktif!");
+  server.send(200, "text/plain", "Dinamo pembalik telur diputar");
 }
 
-// ─── 9. UPDATE TAMPILAN LCD 16x4 I2C ───────────────────────────────────────────────
+void handleLed() {
+  localWebBusyUntil = millis() + 6000UL;
+  manualLight = server.hasArg("state") ? server.arg("state").toInt() > 0 : !manualLight;
+  refreshHeaterPin();
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "application/json", manualLight ? "{\"led\":true}" : "{\"led\":false}");
+}
+
+// ─── LCD 16x4 ─────────────────────────────────────────────────────────────────────
+char lcdCache[4][17];
+
+void lcdLine(uint8_t row, const char *fmt, ...) {
+  char line[17];
+  va_list ap;
+  va_start(ap, fmt);
+  int n = vsnprintf(line, sizeof(line), fmt, ap);
+  va_end(ap);
+  for (int i = constrain(n, 0, 16); i < 16; i++) line[i] = ' ';
+  line[16] = '\0';
+  if (memcmp(line, lcdCache[row], 16) == 0) return;
+  memcpy(lcdCache[row], line, 17);
+  lcd->setCursor(0, row);
+  lcd->print(line);
+}
+
 void updateLcd() {
-  if (!lcdAvailable) return;
-
-  // Baris 0: Suhu & Kelembaban
-  lcd.setCursor(0, 0);
-  lcd.print("T:");
-  if (isnan(currentTemp)) lcd.print("ERR  ");
+  if (!lcd) return;
+  float t = currentTemp, h = currentHum;
+  if (isfinite(t) && isfinite(h)) lcdLine(0, "T:%.1f%cC H:%d%%", t, 223, (int)h);
+  else                            lcdLine(0, "Sensor DHT ERROR");
+  lcdLine(1, "Lampu:%s [%s]", heaterPinOn ? "ON " : "OFF", LAMP_MODE_NAME[lampMode]);
+  if (isMotorRunning) lcdLine(2, "Dinamo: PUTAR");
   else {
-    lcd.print(currentTemp, 1);
-    lcd.print((char)223); // Karakter derajat °
-    lcd.print("C ");
+    long m = secondsUntilTurn() / 60;
+    lcdLine(2, "Putar: %ldj %02ldm", m / 60, m % 60);
   }
-
-  lcd.print("H:");
-  if (isnan(currentHum)) lcd.print("ERR ");
-  else {
-    lcd.print((int)currentHum);
-    lcd.print("%  ");
-  }
-
-  // Baris 1: Status Heater & Mode
-  lcd.setCursor(0, 1);
-  lcd.print("Lamp:");
-  lcd.print(heaterState ? "ON " : "OFF");
-  lcd.print(" [");
-  lcd.print(lampMode);
-  lcd.print("]    ");
-
-  // Baris 2: Status Dinamo Pembalik Telur
-  lcd.setCursor(0, 2);
-  if (isMotorRunning) {
-    lcd.print("Motor: ROTATING...  ");
-  } else {
-    unsigned long timePassed = millis() - lastMotorTurn;
-    long secLeft = (motorIntervalMs > timePassed) ? (motorIntervalMs - timePassed) / 1000 : 0;
-    int m = secLeft / 60;
-    lcd.print("Next Turn: ");
-    if (m >= 60) {
-      lcd.print(m / 60);
-      lcd.print("j ");
-      lcd.print(m % 60);
-      lcd.print("m  ");
-    } else {
-      lcd.print(m);
-      lcd.print("m    ");
-    }
-  }
-
-  // Baris 3: IP Address & Status Upload
-  lcd.setCursor(0, 3);
-  if (lastUploadCode > 0) {
-    lcd.print("Up:");
-    lcd.print(lastUploadCode);
-    lcd.print(" IP:");
-    lcd.print(WiFi.localIP().toString().substring(WiFi.localIP().toString().lastIndexOf('.') + 1));
-    lcd.print("     ");
-  } else {
-    lcd.print("IP:");
-    lcd.print(WiFi.localIP().toString());
-  }
+  if (lastUploadCode) lcdLine(3, "Up:%d IP:.%d", lastUploadCode, WiFi.localIP()[3]);
+  else                lcdLine(3, "%s", WiFi.localIP().toString().c_str());
 }
 
-// ─── 10. SETUP & INITIALIZATION ─────────────────────────────────────────────────────
-void setup() {
-  Serial.begin(115200);
-  delay(400);
-  Serial.println("\n=======================================================");
-  Serial.println("  SISTEM INKUBATOR PENETAS TELUR ESP32-CAM SIAP BOOT  ");
-  Serial.println("=======================================================");
-
-  // Inisialisasi Mutex Kamera
-  cameraMutex = xSemaphoreCreateMutex();
-
-  // Konfigurasi Pin Relay & Flash LED
-  pinMode(PIN_RELAY_HEATER, OUTPUT);
-  pinMode(PIN_RELAY_MOTOR, OUTPUT);
-  pinMode(PIN_RELAY_FAN, OUTPUT);
-  pinMode(PIN_FLASH_LED, OUTPUT);
-
-  // Default: Semua Relay & Flash LED Mati
-  digitalWrite(PIN_RELAY_HEATER, RELAY_OFF);
-  digitalWrite(PIN_RELAY_MOTOR, RELAY_OFF);
-  digitalWrite(PIN_RELAY_FAN, RELAY_OFF);
-  setFlashLed(false);
-
-  // Inisialisasi Sensor DHT22
-  dht.begin();
-
-  // Inisialisasi I2C & LCD 16x4 dengan deteksi keberadaan hardware
+void initLcd() {
   Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
   Wire.setTimeOut(50);
-  Wire.beginTransmission(0x27);
-  if (Wire.endTransmission() == 0) {
-    lcdAvailable = true;
-    lcd.init();
-    lcd.backlight();
-    lcd.setCursor(0, 0);
-    lcd.print("SISTEM INKUBATOR");
-    lcd.setCursor(0, 1);
-    lcd.print("Inisialisasi...");
-  } else {
-    Wire.beginTransmission(0x3F);
+  for (uint8_t addr : {0x27, 0x3F}) {
+    Wire.beginTransmission(addr);
     if (Wire.endTransmission() == 0) {
-      lcd = LiquidCrystal_I2C(0x3F, 16, 4);
-      lcdAvailable = true;
-      lcd.init();
-      lcd.backlight();
-      lcd.setCursor(0, 0);
-      lcd.print("SISTEM INKUBATOR");
-      lcd.setCursor(0, 1);
-      lcd.print("Inisialisasi...");
-    } else {
-      Serial.println("[LCD] I2C LCD tidak terdeteksi, beroperasi tanpa LCD.");
+      lcd = new LiquidCrystal_I2C(addr, 16, 4);
+      lcd->init();
+      lcd->backlight();
+      lcdLine(0, "INKUBATOR TELUR");
+      lcdLine(1, "Menyiapkan...");
+      return;
     }
   }
-
-  // Uji Modul Kamera pada saat boot
-  Serial.println("[CAM] Memeriksa sensor kamera & PSRAM...");
-  if (initCamera()) {
-    Serial.println("[CAM] Inisialisasi awal kamera BERHASIL.");
-    if (lcdAvailable) {
-      lcd.setCursor(0, 2);
-      lcd.print("Kamera: OK");
-    }
-    camStop(); // Matikan sensor agar dingin dan hemat daya sampai dibutuhkan
-  } else {
-    Serial.println("[CAM] Inisialisasi awal kamera GAGAL.");
-    if (lcdAvailable) {
-      lcd.setCursor(0, 2);
-      lcd.print("Kamera: GAGAL!");
-    }
-  }
-
-  // Koneksi Wi-Fi
-  WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false); // Matikan sleep radio untuk stabilitas komunikasi
-  WiFi.setAutoReconnect(true);
-  WiFi.setTxPower(WIFI_POWER_19_5dBm);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-
-  if (lcdAvailable) {
-    lcd.setCursor(0, 3);
-    lcd.print("WiFi Hubungkan..");
-  }
-
-  Serial.printf("[WIFI] Menghubungkan ke SSID: %s ", WIFI_SSID);
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
-    delay(400);
-    Serial.print(".");
-    attempts++;
-  }
-
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf("\n[WIFI] Terhubung! IP: %s | RSSI: %d dBm\n",
-                  WiFi.localIP().toString().c_str(), WiFi.RSSI());
-    if (lcdAvailable) {
-      lcd.clear();
-      lcd.setCursor(0, 0);
-      lcd.print("WiFi Terhubung!");
-      lcd.setCursor(0, 1);
-      lcd.print(WiFi.localIP().toString());
-      delay(1200);
-    }
-  } else {
-    Serial.println("\n[WIFI] Gagal terhubung ke AP! Memulai operasi offline.");
-    if (lcdAvailable) {
-      lcd.clear();
-      lcd.setCursor(0, 0);
-      lcd.print("WiFi Timeout!");
-      delay(1000);
-    }
-  }
-
-  // Daftarkan Endpoint Web Server Lokal
-  server.on("/", HTTP_GET, handleRoot);
-  server.on("/capture", HTTP_GET, handleCapture);
-  server.on("/led", HTTP_GET, handleLed);
-  server.on("/status", HTTP_GET, handleStatus);
-  server.on("/turn", HTTP_GET, handleManualTurn);
-  server.begin();
-  Serial.println("[HTTP] Web Server lokal siap melayani di port 80");
-
-  // Inisialisasi FreeRTOS Background Task untuk Upload Otomatis
-  // Stack 10240 byte mencukupi untuk handshake mbedTLS WiFiClientSecure
-  xTaskCreatePinnedToCore(
-    uploadWorkerTask,
-    "uploadTask",
-    10240,
-    NULL,
-    1,
-    &uploadTaskHandle,
-    0
-  );
-
-  lastMotorTurn = millis();
-  lastUpload    = millis();
-  Serial.println("[SYSTEM] Inisialisasi lengkap. Memulai loop kontrol inkubator.\n");
+  Serial.println("[LCD] tidak terdeteksi");
 }
 
-// ─── 11. MAIN LOOP (NON-BLOCKING) ───────────────────────────────────────────────────
-unsigned long lastSensorRead = 0;
-unsigned long lastLcdUpdate  = 0;
+// ─── SETUP & LOOP ─────────────────────────────────────────────────────────────────
+void setup() {
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+  esp_log_level_set("gpio", ESP_LOG_NONE);
+
+  pinMode(PIN_RELAY_HEATER, OUTPUT);
+  pinMode(PIN_RELAY_MOTOR, OUTPUT);
+  digitalWrite(PIN_RELAY_HEATER, RELAY_OFF);
+  digitalWrite(PIN_RELAY_MOTOR, RELAY_OFF);
+
+  Serial.begin(115200);
+  Serial.println("\n[BOOT] Inkubator ESP32-CAM (UXGA 1600x1200)");
+  cameraMutex = xSemaphoreCreateMutex();
+
+  Preferences prefs;
+  if (prefs.begin("incubator", true)) {
+    prefs.getString("lastMotorCmd", lastMotorCommandId, sizeof(lastMotorCommandId));
+    storedUploadSeconds = constrain(prefs.getUInt("photoSeconds", 120), UPLOAD_MIN_S, UPLOAD_MAX_S);
+    uploadIntervalMs = storedUploadSeconds * 1000UL;
+    prefs.end();
+  }
+
+  dht.begin();
+  initLcd();
+
+  if (camStart()) {
+    Serial.println("[CAM] siap (UXGA, AWB aktif, DMA idle saat tidak memotret)");
+  } else {
+    Serial.println("[CAM] GAGAL inisialisasi");
+  }
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+  esp_wifi_set_ps(WIFI_PS_NONE);  // wajib setelah WiFi.begin() agar modem tidak tidur saat idle
+
+  for (int i = 0; i < 30 && WiFi.status() != WL_CONNECTED; i++) delay(400);
+  esp_wifi_set_ps(WIFI_PS_NONE);
+  Serial.printf("[WIFI] %s %s (RSSI %d dBm)\n",
+                WiFi.status() == WL_CONNECTED ? "terhubung" : "offline",
+                WiFi.localIP().toString().c_str(), WiFi.RSSI());
+
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/capture", HTTP_GET, handleCapture);
+  server.on("/status", HTTP_GET, handleStatus);
+  server.on("/turn", HTTP_GET, handleTurn);
+  server.on("/led", HTTP_GET, handleLed);
+  server.on("/favicon.ico", HTTP_GET, []() { server.send(204); });
+  server.begin();
+
+  lastMotorTurn = millis();
+  xTaskCreatePinnedToCore(cloudTask, "cloud", 12288, NULL, 1, NULL, 0);
+}
 
 void loop() {
-  // 1. Layani permintaan HTTP dari browser / dashboard secara non-blocking
+  static uint32_t lastSensor = 0, lastLcd = 0;
+  static uint8_t dhtFails = 0;
+
   server.handleClient();
+  uint32_t now = millis();
 
-  unsigned long now = millis();
-
-  // 2. Baca Sensor DHT22 & Update Termostat setiap 2 detik
-  if (now - lastSensorRead >= 2000) {
-    lastSensorRead = now;
+  if (now - lastSensor >= 2000) {
+    lastSensor = now;
     float t = dht.readTemperature();
     float h = dht.readHumidity();
-
-    if (!isnan(t) && !isnan(h)) {
+    if (isfinite(t) && isfinite(h)) {
       currentTemp = t;
-      currentHum  = h;
+      currentHum = h;
+      dhtFails = 0;
+    } else if (++dhtFails >= DHT_MAX_FAILS) {
+      currentTemp = NAN;
+      currentHum = NAN;
     }
     updateThermostat();
   }
 
-  // 3. Update Display LCD 16x4 setiap 1 detik
-  if (now - lastLcdUpdate >= 1000) {
-    lastLcdUpdate = now;
+  refreshHeaterPin();
+  updateMotor(now);
+
+  if (now - lastLcd >= 1000) {
+    lastLcd = now;
     updateLcd();
-  }
-
-  // 4. Polling perintah kontrol jarak jauh dari server setiap 3.5 detik
-  if (now - lastControlPoll >= CONTROL_POLL_MS) {
-    lastControlPoll = now;
-    pollCloudControl();
-  }
-
-  // 5. Trigger Background Upload otomatis setiap 20 detik (Non-Blocking)
-  if (now - lastUpload >= AUTO_UPLOAD_INTERVAL) {
-    lastUpload = now;
-    if (!uploadInProgress && uploadTaskHandle != NULL) {
-      Serial.println("[AUTO] Memicu background upload ke cloud...");
-      xTaskNotifyGive(uploadTaskHandle);
-    }
   }
 }

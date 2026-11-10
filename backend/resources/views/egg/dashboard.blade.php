@@ -420,6 +420,195 @@
         .history-dl:hover {
             text-decoration: underline;
         }
+
+        /* Incubator Control & Monitoring Panel */
+        .incubator-panel { margin-top: 32px; }
+        .incubator-telemetry-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+            gap: 16px;
+            margin: 18px 0 24px 0;
+        }
+        .telemetry-card {
+            background-color: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 10px;
+            padding: 16px;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+        .telemetry-label {
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--text-secondary);
+            font-weight: 600;
+        }
+        .telemetry-value {
+            font-size: 26px;
+            font-weight: 700;
+            color: var(--text-primary);
+        }
+        .telemetry-sub {
+            font-size: 12px;
+            color: var(--text-muted);
+        }
+        .badge-status {
+            display: inline-block;
+            padding: 3px 10px;
+            border-radius: 9999px;
+            font-size: 11px;
+            font-weight: 700;
+            text-transform: uppercase;
+        }
+        .badge-on { background: rgba(16, 185, 129, 0.2); color: #10b981; border: 1px solid rgba(16, 185, 129, 0.4); }
+        .badge-off { background: rgba(148, 163, 184, 0.15); color: #94a3b8; border: 1px solid rgba(148, 163, 184, 0.3); }
+        .badge-warn { background: rgba(245, 158, 11, 0.2); color: #f59e0b; border: 1px solid rgba(245, 158, 11, 0.4); }
+
+        .control-subsections {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+            gap: 20px;
+            margin-top: 10px;
+        }
+        .control-box {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            gap: 14px;
+        }
+        .control-box-title {
+            font-size: 15px;
+            font-weight: 700;
+            color: var(--text-primary);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .control-box-desc {
+            font-size: 12px;
+            color: var(--text-secondary);
+            line-height: 1.5;
+        }
+
+        .btn-group-mode {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 6px;
+            background: var(--bg-input);
+            padding: 4px;
+            border-radius: 8px;
+            border: 1px solid var(--border-color);
+        }
+        .btn-mode {
+            background: transparent;
+            border: none;
+            color: var(--text-secondary);
+            padding: 8px 10px;
+            font-size: 12px;
+            font-weight: 600;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: all 0.2s;
+            text-align: center;
+        }
+        .btn-mode:hover { color: var(--text-primary); }
+        .btn-mode.active {
+            background: var(--primary);
+            color: #111827;
+            font-weight: 700;
+            box-shadow: 0 2px 8px var(--primary-glow);
+        }
+
+        .btn-motor-trigger {
+            width: 100%;
+            min-height: 48px;
+            background: linear-gradient(135deg, #0284c7, #0369a1);
+            color: #ffffff;
+            border: 1px solid #38bdf8;
+            border-radius: 8px;
+            font-size: 14px;
+            font-weight: 700;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            transition: all 0.2s;
+            box-shadow: 0 4px 12px rgba(2, 132, 199, 0.3);
+        }
+        .btn-motor-trigger:hover:not(:disabled) {
+            background: linear-gradient(135deg, #0369a1, #075985);
+            transform: translateY(-1px);
+        }
+        .btn-motor-trigger:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .form-row {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 12px;
+        }
+        .field-group {
+            display: grid;
+            gap: 6px;
+        }
+        .field-group label {
+            font-size: 12px;
+            font-weight: 600;
+            color: var(--text-secondary);
+        }
+        .field-group input {
+            width: 100%;
+            min-height: 40px;
+            padding: 8px 12px;
+            color: var(--text-primary);
+            background: var(--bg-input);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            font-size: 14px;
+        }
+        .field-group input:focus {
+            border-color: var(--primary);
+            outline: none;
+        }
+        .btn-save-sm {
+            min-height: 40px;
+            background: var(--primary);
+            color: #111827;
+            border: none;
+            border-radius: 8px;
+            font-size: 13px;
+            font-weight: 700;
+            cursor: pointer;
+            padding: 8px 16px;
+            transition: 0.2s;
+        }
+        .btn-save-sm:hover:not(:disabled) { background: var(--primary-hover); }
+        .btn-save-sm:disabled { opacity: 0.6; cursor: wait; }
+        .feedback-msg {
+            font-size: 12px;
+            color: var(--text-secondary);
+            min-height: 1.4em;
+        }
+
+        .interval-settings { margin-top: 24px; }
+        .interval-settings .slider-desc { color: var(--text-secondary); }
+        .interval-form { display: flex; flex-wrap: wrap; gap: 12px; align-items: end; margin-top: 14px; }
+        .interval-field { display: grid; gap: 6px; flex: 1 1 220px; max-width: 360px; }
+        .interval-field label { font-size: 13px; font-weight: 600; }
+        .interval-field input { width: 100%; min-height: 44px; padding: 10px; color: var(--text-primary); background: var(--bg-input); border: 1px solid var(--text-secondary); border-radius: 8px; }
+        .interval-form button { min-height: 44px; background: var(--primary); color: #111827; border: 0; }
+        .interval-form button:disabled { opacity: .6; cursor: wait; }
+        .interval-form :focus-visible { outline: 2px solid var(--primary); outline-offset: 3px; }
+        .interval-message { min-height: 1.4em; margin-top: 10px; color: var(--text-secondary); font-size: 13px; }
     </style>
 </head>
 <body>
@@ -467,30 +656,37 @@
                         <span id="val-gain" class="control-value">0</span>
                     </div>
                     <input id="slider-gain" type="range" min="0" max="30" value="0" class="slider">
-                    <div class="slider-desc">Rentang: 0 - 30 (Default: 0)</div>
+                    <div class="slider-desc">Rentang: 0 - 30 (Default: 0 - Disarankan 0 agar bebas noise)</div>
                 </div>
 
                 <div class="control-group">
                     <div class="control-label-row">
                         <span class="control-label">Kualitas JPEG</span>
-                        <span id="val-quality" class="control-value">6</span>
+                        <span id="val-quality" class="control-value">4</span>
                     </div>
-                    <input id="slider-quality" type="range" min="4" max="15" value="6" class="slider">
-                    <div class="slider-desc">Rentang: 4 (Tinggi) - 15 (Rendah)</div>
+                    <input id="slider-quality" type="range" min="4" max="15" value="4" class="slider">
+                    <div class="slider-desc">Rentang: 4 (Paling Tajam & Jernih) - 15 (Rendah)</div>
                 </div>
 
                 <div class="control-group">
                     <div class="control-label-row">
                         <span class="control-label">LED Settle Delay (ms)</span>
-                        <span id="val-settle" class="control-value">250</span>
+                        <span id="val-settle" class="control-value">350</span>
                     </div>
-                    <input id="slider-settle" type="range" min="100" max="3000" step="50" value="250" class="slider">
-                    <div class="slider-desc">Waktu tunggu LED sebelum jepret (100 - 3000 ms)</div>
+                    <input id="slider-settle" type="range" min="100" max="3000" step="50" value="350" class="slider">
+                    <div class="slider-desc">Waktu tunggu LED sebelum jepret (Default: 350 ms agar sensor stabil)</div>
                 </div>
 
                 <button id="btn-capture" class="btn-capture">
                     <span>📷 Ambil Foto</span>
                 </button>
+
+                <form id="candling-upload-form" style="margin-top: 24px; display: grid; gap: 10px;">
+                    <label for="candling-image" class="control-label">Atau unggah foto candling (JPEG/PNG, maks. 5 MB)</label>
+                    <input id="candling-image" name="image" type="file" accept="image/jpeg,image/png" required>
+                    <button id="candling-upload-button" class="btn-save-sm" type="submit">Unggah & Analisis</button>
+                    <div id="candling-upload-message" class="feedback-msg" role="status" aria-live="polite"></div>
+                </form>
 
                 <div id="tracker-box" class="tracker-card">
                     <div class="tracker-status">
@@ -587,6 +783,7 @@
                     </div>
                 </div>
 
+                <div id="candling-metrics" class="feedback-msg" style="margin-top: 16px;" role="status"></div>
                 <div class="preview-actions">
                     <a id="btn-download" class="btn-action btn-download" style="display: none;" download="egg-candling.jpg">
                         ⬇️ Unduh Foto
@@ -594,6 +791,160 @@
                 </div>
             </section>
         </main>
+
+        <!-- Section: Panel Kontrol & Pemantauan Inkubator (Suhu & Dinamo Goyang) -->
+        <section class="card incubator-panel" id="incubator-section" aria-labelledby="incubator-title">
+            <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; border-bottom: 1px solid var(--border-color); padding-bottom: 16px;">
+                <div class="card-header" style="margin-bottom: 0;">
+                    <h2 id="incubator-title" class="card-title">🎛️ Kontrol & Monitoring Inkubator (Suhu & Dinamo)</h2>
+                    <p class="slider-desc" style="margin-top: 4px;">Kendali manual suhu & lampu pemanas, pembalik telur (dinamo goyang), dan telemetri sensor DHT22.</p>
+                </div>
+                <div>
+                    <span id="inc-device-badge" class="badge-status badge-off">ESP Inkubator: Offline</span>
+                </div>
+            </div>
+
+            <!-- Live Telemetry Grid -->
+            <div class="incubator-telemetry-grid">
+                <div class="telemetry-card">
+                    <span class="telemetry-label">Suhu Lingkungan</span>
+                    <div class="telemetry-value"><span id="tele-temp">--</span>°C</div>
+                    <span class="telemetry-sub" id="tele-temp-sub">Setpoint: <span id="tele-setpoint-range">37.0 - 38.0</span>°C</span>
+                </div>
+                <div class="telemetry-card">
+                    <span class="telemetry-label">Kelembaban Udara</span>
+                    <div class="telemetry-value"><span id="tele-hum">--</span>%</div>
+                    <span class="telemetry-sub">Sensor DHT22 Real-time</span>
+                </div>
+                <div class="telemetry-card">
+                    <span class="telemetry-label">Lampu Pemanas</span>
+                    <div style="margin-top: 4px;">
+                        <span id="tele-lamp-status" class="badge-status badge-off">MATI (OFF)</span>
+                    </div>
+                    <span class="telemetry-sub" style="margin-top: 6px;">Mode: <strong id="tele-lamp-mode">Auto</strong></span>
+                </div>
+                <div class="telemetry-card">
+                    <span class="telemetry-label">Dinamo Pembalik Telur</span>
+                    <div style="margin-top: 4px;">
+                        <span id="tele-motor-status" class="badge-status badge-off">STANDBY</span>
+                    </div>
+                    <span class="telemetry-sub" style="margin-top: 6px;" id="tele-motor-info">Tiap 4 jam (15s)</span>
+                </div>
+            </div>
+
+            <!-- Control Panels Subsections -->
+            <div class="control-subsections">
+                <!-- 1. Kontrol Suhu & Pemanas -->
+                <div class="control-box">
+                    <div class="control-box-title">
+                        <span>🔥 Kontrol Suhu & Mode Lampu</span>
+                    </div>
+                    <p class="control-box-desc">Atur mode pemanas secara manual atau otomatis, serta batas histeresis termostat lampu.</p>
+                    
+                    <div style="display: grid; gap: 8px;">
+                        <label style="font-size: 12px; font-weight: 600; color: var(--text-secondary);">Mode Lampu Pemanas</label>
+                        <div class="btn-group-mode" role="group" aria-label="Mode Lampu">
+                            <button type="button" class="btn-mode active" id="btn-mode-auto" onclick="setLampMode('auto')">Auto (Termostat)</button>
+                            <button type="button" class="btn-mode" id="btn-mode-on" onclick="setLampMode('on')">Manual ON</button>
+                            <button type="button" class="btn-mode" id="btn-mode-off" onclick="setLampMode('off')">Manual OFF</button>
+                        </div>
+                    </div>
+
+                    <form id="temp-form" style="display: grid; gap: 12px; margin-top: 6px;">
+                        <div class="form-row">
+                            <div class="field-group">
+                                <label for="input-temp-min">Suhu Min Lampu ON (°C)</label>
+                                <input id="input-temp-min" type="number" step="0.1" min="30" max="45" value="37.0" required>
+                            </div>
+                            <div class="field-group">
+                                <label for="input-temp-max">Suhu Max Lampu OFF (°C)</label>
+                                <input id="input-temp-max" type="number" step="0.1" min="30" max="45" value="38.0" required>
+                            </div>
+                        </div>
+                        <button id="btn-save-temp" class="btn-save-sm" type="submit">Simpan Setpoint Suhu</button>
+                        <div id="msg-temp" class="feedback-msg"></div>
+                    </form>
+                </div>
+
+                <!-- 2. Kontrol Dinamo Goyang -->
+                <div class="control-box">
+                    <div class="control-box-title">
+                        <span>🔄 Dinamo Goyang (Pembalik Telur)</span>
+                    </div>
+                    <p class="control-box-desc">Picu pembalikan telur manual sekarang juga atau sesuaikan jadwal putar dinamo otomatis.</p>
+
+                    <!-- Tombol Manual Goyang Sekarang -->
+                    <div>
+                        <button type="button" id="btn-trigger-motor" class="btn-motor-trigger" onclick="triggerMotorManual()">
+                            <span id="motor-btn-icon">⚡</span>
+                            <span id="motor-btn-text">Putar / Goyang Dinamo Sekarang</span>
+                        </button>
+                        <div id="msg-motor-trigger" class="feedback-msg" style="margin-top: 8px;"></div>
+                    </div>
+
+                    <form id="motor-form" style="display: grid; gap: 12px; border-top: 1px solid var(--border-color); padding-top: 14px;">
+                        <div class="form-row">
+                            <div class="field-group">
+                                <label for="input-motor-hours">Interval Putar (Jam)</label>
+                                <input id="input-motor-hours" type="number" min="1" max="24" step="1" value="4" required>
+                            </div>
+                            <div class="field-group">
+                                <label for="input-motor-duration">Durasi Putar (Detik)</label>
+                                <input id="input-motor-duration" type="number" min="1" max="180" step="1" value="15" required>
+                            </div>
+                        </div>
+                        <button id="btn-save-motor" class="btn-save-sm" type="submit">Simpan Jadwal Dinamo</button>
+                        <div id="msg-motor-schedule" class="feedback-msg"></div>
+                    </form>
+                </div>
+
+                <!-- 3. Kamera & Jeda Foto + Lampu Otomatis Inkubator -->
+                <div class="control-box">
+                    <div class="control-box-title">
+                        <span>📷 Interval Foto & Nyala Lampu/LED</span>
+                    </div>
+                    <p class="control-box-desc">Atur jeda waktu ESP32-CAM menyalakan lampu warm/LED dan memotret rak telur otomatis ke web (disimpan 1 jam terakhir).</p>
+
+                    <form id="interval-form" style="display: grid; gap: 12px; margin-top: auto;">
+                        <div class="field-group">
+                            <label for="capture-interval">Interval Foto & Lampu (Detik)</label>
+                            <input id="capture-interval" type="number" min="15" max="3600" step="1" value="120" required>
+                            <span class="control-box-desc">Nilai antara 15 sampai 3600 detik (default: 120 detik / 2 menit).</span>
+                        </div>
+                        <button id="interval-save" class="btn-save-sm" type="submit">Simpan Interval</button>
+                        <div id="interval-message" class="feedback-msg"></div>
+                    </form>
+                </div>
+            </div>
+
+            <!-- Live Preview & Galeri Foto Kamera Inkubator (1 Jam Terakhir) -->
+            <div style="margin-top: 24px; border-top: 1px solid var(--border-color); padding-top: 20px;">
+                <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; margin-bottom: 14px;">
+                    <div>
+                        <h3 class="card-title">📸 Foto Kamera Inkubator & Riwayat 1 Jam Terakhir</h3>
+                        <p class="slider-desc" style="margin-top: 4px;">Foto otomatis dari ESP32-CAM inkubator disimpan selama 1 jam terakhir (otomatis terhapus setelah &gt;1 jam).</p>
+                    </div>
+                    <span id="inc-photo-count" class="badge-status badge-off">0 foto (1 jam terakhir)</span>
+                </div>
+
+                <!-- Preview Foto Inkubator yang Dipilih / Terbaru -->
+                <div class="preview-container" style="min-height: 360px; margin-bottom: 16px;">
+                    <div id="inc-preview-empty" class="preview-empty">
+                        <p>Belum ada foto inkubator dalam 1 jam terakhir.<br>ESP32-CAM akan mengunggah foto otomatis sesuai jeda yang diatur.</p>
+                    </div>
+                    <img id="inc-preview-img" class="preview-img" style="max-height: 760px; width: 100%; cursor: zoom-in;" title="Klik untuk buka ukuran penuh (100%)" onclick="if(this.src)window.open(this.src,'_blank')" alt="Foto Kamera Inkubator">
+                </div>
+                <div id="inc-preview-meta" style="display: none; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; margin-bottom: 20px; font-size: 13px; color: var(--text-secondary);">
+                    <div id="inc-preview-info">-</div>
+                    <a id="inc-preview-download" class="btn-action btn-download" href="#" download="incubator.jpg">⬇️ Unduh Foto Ini</a>
+                </div>
+
+                <!-- Grid Galeri 1 Jam Terakhir -->
+                <div id="inc-history-grid" class="history-grid">
+                    <div style="color: var(--text-muted); font-size: 13px; grid-column: 1/-1;">Belum ada foto inkubator dalam 1 jam terakhir.</div>
+                </div>
+            </div>
+        </section>
 
         <!-- History Section -->
         <section class="history-section">
@@ -605,7 +956,308 @@
     </div>
 
     <script>
+        // ─── Kontrol & Telemetri Inkubator (Suhu & Dinamo Goyang) ────────────────────
         const csrfToken = document.querySelector('meta[name="csrf-token"]').getAttribute('content');
+
+        const inputTempMin = document.getElementById('input-temp-min');
+        const inputTempMax = document.getElementById('input-temp-max');
+        const btnSaveTemp = document.getElementById('btn-save-temp');
+        const msgTemp = document.getElementById('msg-temp');
+
+        const inputMotorHours = document.getElementById('input-motor-hours');
+        const inputMotorDuration = document.getElementById('input-motor-duration');
+        const btnSaveMotor = document.getElementById('btn-save-motor');
+        const btnTriggerMotor = document.getElementById('btn-trigger-motor');
+        const motorBtnText = document.getElementById('motor-btn-text');
+        const msgMotorTrigger = document.getElementById('msg-motor-trigger');
+        const msgMotorSchedule = document.getElementById('msg-motor-schedule');
+
+        const intervalInput = document.getElementById('capture-interval');
+        const intervalButton = document.getElementById('interval-save');
+        const intervalMessage = document.getElementById('interval-message');
+
+        function updateModeButtons(mode) {
+            ['auto', 'on', 'off'].forEach(m => {
+                const btn = document.getElementById(`btn-mode-${m}`);
+                if (btn) {
+                    if (m === mode) btn.classList.add('active');
+                    else btn.classList.remove('active');
+                }
+            });
+        }
+
+        async function setLampMode(mode) {
+            updateModeButtons(mode);
+            msgTemp.style.color = 'var(--text-secondary)';
+            msgTemp.textContent = `Mengubah mode lampu ke ${mode.toUpperCase()}...`;
+            try {
+                const res = await fetch('/incubator/control', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'X-CSRF-TOKEN': csrfToken },
+                    body: JSON.stringify({ lampMode: mode })
+                });
+                if (!res.ok) throw new Error();
+                document.getElementById('tele-lamp-mode').textContent = mode === 'auto' ? 'Auto (Termostat)' : (mode === 'on' ? 'Manual ON' : 'Manual OFF');
+                msgTemp.style.color = 'var(--success)';
+                msgTemp.textContent = `Mode lampu berhasil diubah ke: ${mode.toUpperCase()}`;
+            } catch (e) {
+                msgTemp.style.color = 'var(--danger)';
+                msgTemp.textContent = 'Gagal mengubah mode lampu. Periksa koneksi.';
+            }
+        }
+
+        document.getElementById('temp-form').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const min = parseFloat(inputTempMin.value);
+            const max = parseFloat(inputTempMax.value);
+            if (min >= max) {
+                msgTemp.style.color = 'var(--danger)';
+                msgTemp.textContent = 'Suhu Min harus lebih kecil dari Suhu Max!';
+                return;
+            }
+            btnSaveTemp.disabled = true;
+            msgTemp.style.color = 'var(--text-secondary)';
+            msgTemp.textContent = 'Menyimpan setpoint suhu ke cloud...';
+            try {
+                const res = await fetch('/incubator/control', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'X-CSRF-TOKEN': csrfToken },
+                    body: JSON.stringify({ tempMin: min, tempMax: max })
+                });
+                if (!res.ok) throw new Error();
+                document.getElementById('tele-setpoint-range').textContent = `${min.toFixed(1)} - ${max.toFixed(1)}`;
+                msgTemp.style.color = 'var(--success)';
+                msgTemp.textContent = 'Setpoint suhu berhasil disimpan! ESP32 akan menerapkannya.';
+            } catch (err) {
+                msgTemp.style.color = 'var(--danger)';
+                msgTemp.textContent = 'Gagal menyimpan setpoint suhu.';
+            } finally {
+                btnSaveTemp.disabled = false;
+            }
+        });
+
+        async function triggerMotorManual() {
+            if (!confirm('Putar / goyang dinamo pembalik telur sekarang?')) return;
+            btnTriggerMotor.disabled = true;
+            motorBtnText.textContent = 'Mengirim Perintah Dinamo...';
+            msgMotorTrigger.style.color = 'var(--info)';
+            msgMotorTrigger.textContent = 'Mengirim instruksi putar dinamo ke cloud...';
+
+            try {
+                const res = await fetch('/incubator/control', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'X-CSRF-TOKEN': csrfToken },
+                    body: JSON.stringify({ triggerMotor: true })
+                });
+                if (!res.ok) throw new Error();
+                msgMotorTrigger.style.color = 'var(--success)';
+                msgMotorTrigger.textContent = '✅ Perintah berhasil dikirim! ESP32 akan langsung memutar dinamo pembalik telur.';
+                motorBtnText.textContent = 'Perintah Terkirim (Menunggu Putaran)';
+                setTimeout(() => {
+                    btnTriggerMotor.disabled = false;
+                    motorBtnText.textContent = 'Putar / Goyang Dinamo Sekarang';
+                }, 6000);
+            } catch (e) {
+                msgMotorTrigger.style.color = 'var(--danger)';
+                msgMotorTrigger.textContent = 'Gagal mengirim perintah putar dinamo.';
+                btnTriggerMotor.disabled = false;
+                motorBtnText.textContent = 'Putar / Goyang Dinamo Sekarang';
+            }
+        }
+
+        document.getElementById('motor-form').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            btnSaveMotor.disabled = true;
+            msgMotorSchedule.style.color = 'var(--text-secondary)';
+            msgMotorSchedule.textContent = 'Menyimpan jadwal dinamo...';
+            try {
+                const hours = parseInt(inputMotorHours.value);
+                const duration = parseInt(inputMotorDuration.value);
+                const res = await fetch('/incubator/control', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'X-CSRF-TOKEN': csrfToken },
+                    body: JSON.stringify({ motorIntervalHours: hours, motorDurationSeconds: duration })
+                });
+                if (!res.ok) throw new Error();
+                document.getElementById('tele-motor-info').textContent = `Tiap ${hours} jam (${duration}s)`;
+                msgMotorSchedule.style.color = 'var(--success)';
+                msgMotorSchedule.textContent = 'Jadwal putaran dinamo berhasil disimpan!';
+            } catch (e) {
+                msgMotorSchedule.style.color = 'var(--danger)';
+                msgMotorSchedule.textContent = 'Gagal menyimpan jadwal dinamo.';
+            } finally {
+                btnSaveMotor.disabled = false;
+            }
+        });
+
+        document.getElementById('interval-form').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            intervalButton.disabled = true;
+            intervalMessage.style.color = 'var(--text-secondary)';
+            intervalMessage.textContent = 'Menyimpan jeda foto...';
+            try {
+                const sec = parseInt(intervalInput.value);
+                const res = await fetch('/incubator/control', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'X-CSRF-TOKEN': csrfToken },
+                    body: JSON.stringify({ captureIntervalSeconds: sec })
+                });
+                if (!res.ok) throw new Error();
+                intervalMessage.style.color = 'var(--success)';
+                intervalMessage.textContent = 'Jeda unggah foto tersimpan!';
+            } catch (e) {
+                intervalMessage.style.color = 'var(--danger)';
+                intervalMessage.textContent = 'Gagal menyimpan jeda foto.';
+            } finally {
+                intervalButton.disabled = false;
+            }
+        });
+
+        async function pollIncubatorTelemetry() {
+            try {
+                const res = await fetch('/incubator/latest');
+                if (!res.ok) return;
+                const data = await res.json();
+
+                // Telemetri Suhu & Kelembaban
+                const teleTemp = document.getElementById('tele-temp');
+                const teleHum = document.getElementById('tele-hum');
+                if (data.temperature !== null && data.temperature !== undefined) {
+                    teleTemp.textContent = parseFloat(data.temperature).toFixed(1);
+                }
+                if (data.humidity !== null && data.humidity !== undefined) {
+                    teleHum.textContent = Math.round(data.humidity);
+                }
+
+                // Telemetri Lampu
+                const teleLamp = document.getElementById('tele-lamp-status');
+                if (data.lamp) {
+                    teleLamp.className = 'badge-status badge-on';
+                    teleLamp.textContent = 'MENYALA (ON)';
+                } else {
+                    teleLamp.className = 'badge-status badge-off';
+                    teleLamp.textContent = 'MATI (OFF)';
+                }
+
+                // Telemetri Dinamo
+                const teleMotor = document.getElementById('tele-motor-status');
+                if (data.motor) {
+                    teleMotor.className = 'badge-status badge-warn';
+                    teleMotor.textContent = 'SEDANG BERPUTAR';
+                } else {
+                    teleMotor.className = 'badge-status badge-off';
+                    teleMotor.textContent = 'STANDBY';
+                }
+
+                // Status Koneksi ESP Inkubator
+                const incBadge = document.getElementById('inc-device-badge');
+                if (data.online) {
+                    incBadge.className = 'badge-status badge-on';
+                    incBadge.textContent = 'ESP Inkubator: Online';
+                } else {
+                    incBadge.className = 'badge-status badge-off';
+                    incBadge.textContent = data.last_seen_sec !== null ? `ESP Offline (${data.last_seen_sec}s lalu)` : 'ESP Inkubator: Offline';
+                }
+
+                // Update Control Values jika ada & user tidak sedang mengetik
+                if (data.control) {
+                    const c = data.control;
+                    if (c.lampMode) {
+                        updateModeButtons(c.lampMode);
+                        document.getElementById('tele-lamp-mode').textContent = c.lampMode === 'auto' ? 'Auto (Termostat)' : (c.lampMode === 'on' ? 'Manual ON' : 'Manual OFF');
+                    }
+                    if (c.tempMin !== undefined && c.tempMax !== undefined) {
+                        document.getElementById('tele-setpoint-range').textContent = `${parseFloat(c.tempMin).toFixed(1)} - ${parseFloat(c.tempMax).toFixed(1)}`;
+                        if (document.activeElement !== inputTempMin) inputTempMin.value = c.tempMin;
+                        if (document.activeElement !== inputTempMax) inputTempMax.value = c.tempMax;
+                    }
+                    if (c.motorIntervalHours !== undefined && c.motorDurationSeconds !== undefined) {
+                        document.getElementById('tele-motor-info').textContent = `Tiap ${c.motorIntervalHours} jam (${c.motorDurationSeconds}s)`;
+                        if (document.activeElement !== inputMotorHours) inputMotorHours.value = c.motorIntervalHours;
+                        if (document.activeElement !== inputMotorDuration) inputMotorDuration.value = c.motorDurationSeconds;
+                    }
+                    if (c.captureIntervalSeconds !== undefined && document.activeElement !== intervalInput) {
+                        intervalInput.value = c.captureIntervalSeconds;
+                    }
+                }
+
+                // Render Foto Terbaru & Galeri Riwayat 1 Jam Terakhir
+                const history = Array.isArray(data.history) ? data.history : [];
+                const countBadge = document.getElementById('inc-photo-count');
+                countBadge.textContent = `${history.length} foto (1 jam terakhir)`;
+                countBadge.className = history.length > 0 ? 'badge-status badge-on' : 'badge-status badge-off';
+
+                const incGrid = document.getElementById('inc-history-grid');
+                const historySignature = history.map(h => h.id).join(',');
+                if (history.length === 0) {
+                    if (window._lastIncSig !== '') {
+                        window._lastIncSig = '';
+                        incGrid.innerHTML = '<div style="color: var(--text-muted); font-size: 13px; grid-column: 1/-1;">Belum ada foto inkubator dalam 1 jam terakhir.</div>';
+                    }
+                } else if (window._lastIncSig !== historySignature) {
+                    const wasViewingLatest = !window._selectedIncId || window._selectedIncId === (window._lastLatestIncId || '');
+                    window._lastIncSig = historySignature;
+                    window._lastLatestIncId = history[0].id;
+                    window._incHistoryData = history;
+
+                    if (wasViewingLatest || !history.some(h => h.id === window._selectedIncId)) {
+                        selectIncubatorPhoto(history[0].id);
+                    }
+
+                    incGrid.innerHTML = history.map(item => {
+                        const timeStr = new Date(item.at).toLocaleTimeString('id-ID');
+                        const tempStr = item.temperature !== null && item.temperature !== undefined ? `${parseFloat(item.temperature).toFixed(1)}°C` : '--°C';
+                        const humStr = item.humidity !== null && item.humidity !== undefined ? `${Math.round(item.humidity)}%` : '--%';
+                        return `
+                            <div class="history-item">
+                                <img src="${item.url}" class="history-thumb" alt="Foto Inkubator ${timeStr}" onclick="selectIncubatorPhoto('${item.id}')">
+                                <div class="history-meta">
+                                    <div>
+                                        <span class="history-id">${timeStr}</span>
+                                        <div style="color: var(--text-muted);">${tempStr} · ${humStr} · ${item.size_kb || 0} KB</div>
+                                    </div>
+                                    <a href="${item.url}" download="${item.filename || 'incubator.jpg'}" class="history-dl">Unduh</a>
+                                </div>
+                            </div>
+                        `;
+                    }).join('');
+                }
+            } catch (e) {
+                // Silently handle transient network issues
+            }
+        }
+
+        function selectIncubatorPhoto(id) {
+            const list = window._incHistoryData || [];
+            const item = list.find(h => h.id === id) || list[0];
+            if (!item) return;
+            window._selectedIncId = item.id;
+
+            const img = document.getElementById('inc-preview-img');
+            const empty = document.getElementById('inc-preview-empty');
+            const meta = document.getElementById('inc-preview-meta');
+            const info = document.getElementById('inc-preview-info');
+            const dl = document.getElementById('inc-preview-download');
+
+            img.src = item.url;
+            img.style.display = 'block';
+            empty.style.display = 'none';
+            meta.style.display = 'flex';
+            dl.href = item.url;
+            dl.download = item.filename || 'incubator.jpg';
+
+            const timeStr = new Date(item.at).toLocaleTimeString('id-ID');
+            const tempStr = item.temperature !== null && item.temperature !== undefined ? `${parseFloat(item.temperature).toFixed(1)}°C` : '--°C';
+            const humStr = item.humidity !== null && item.humidity !== undefined ? `${Math.round(item.humidity)}%` : '--%';
+            const baseInfo = `<strong>Waktu:</strong> ${timeStr} &nbsp;|&nbsp; <strong>Suhu:</strong> ${tempStr} &nbsp;|&nbsp; <strong>Kelembaban:</strong> ${humStr} &nbsp;|&nbsp; <strong>Ukuran:</strong> ${item.size_kb || 0} KB`;
+            info.innerHTML = baseInfo;
+            img.onload = () => {
+                info.innerHTML = `${baseInfo} &nbsp;|&nbsp; <strong>Resolusi:</strong> ${img.naturalWidth}×${img.naturalHeight} px`;
+            };
+        }
+
+        pollIncubatorTelemetry();
+        setInterval(pollIncubatorTelemetry, 3000);
 
         // Sliders binding
         const sliders = [
@@ -694,6 +1346,7 @@
                 const pred = job.prediction_result || { label: job.prediction_label, confidence: job.confidence };
                 const vis = job.prediction_result ? job.prediction_result.visualisasi : null;
                 showInPreview(job.url, pred, job.llm_analysis, vis);
+                showCandlingMetrics(job.metrics);
                 window.scrollTo({ top: 0, behavior: 'smooth' });
             } catch (e) {
                 console.error(e);
@@ -771,6 +1424,49 @@
                 }
             }
         }
+
+        function showCandlingMetrics(metrics, browserMs = null) {
+            const output = document.getElementById('candling-metrics');
+            if (!metrics) { output.textContent = ''; return; }
+            const values = [
+                `Ukuran: ${(metrics.image_bytes / 1024).toFixed(1)} KB`,
+                `Permintaan Flask (termasuk jaringan): ${metrics.model_request_ms} ms`,
+                `Permintaan LLM (termasuk jaringan): ${metrics.llm_request_ms === null ? 'tidak dipanggil' : metrics.llm_request_ms + ' ms'}`,
+                `Pemrosesan server sebelum penyimpanan: ${metrics.server_processing_ms} ms`
+            ];
+            if (browserMs !== null) values.push(`Total browser hingga respons: ${browserMs.toFixed(0)} ms`);
+            output.textContent = values.join(' · ');
+        }
+
+        document.getElementById('candling-upload-form').addEventListener('submit', async (event) => {
+            event.preventDefault();
+            const button = document.getElementById('candling-upload-button');
+            const message = document.getElementById('candling-upload-message');
+            const file = document.getElementById('candling-image').files[0];
+            if (!file) return;
+            button.disabled = true;
+            message.textContent = 'Mengunggah dan menganalisis foto...';
+            document.getElementById('candling-metrics').textContent = '';
+            const body = new FormData();
+            body.append('image', file);
+            const started = performance.now();
+            try {
+                const response = await fetch('/egg/upload', {
+                    method: 'POST', headers: { 'Accept': 'application/json', 'X-CSRF-TOKEN': csrfToken }, body
+                });
+                const data = await response.json();
+                if (!response.ok) throw new Error(data.errors?.image?.[0] || data.message || 'Unggah gagal.');
+                const browserMs = performance.now() - started;
+                showInPreview(data.url, data.prediction_result, data.llm_analysis, data.prediction_result?.visualisasi);
+                showCandlingMetrics(data.metrics, browserMs);
+                message.textContent = data.llm_status === 'failed' ? 'Hasil model tersedia; LLM gagal merespons.' : (data.llm_status === 'not_configured' ? 'Hasil model tersedia; LLM belum dikonfigurasi.' : 'Foto berhasil dianalisis.');
+                loadHistory();
+            } catch (error) {
+                message.textContent = error.message || 'Tidak dapat terhubung ke server.';
+            } finally {
+                button.disabled = false;
+            }
+        });
 
         // Capture Job Dispatch & Tracker
         const btnCapture = document.getElementById('btn-capture');
@@ -852,6 +1548,7 @@
                             const pred = job.prediction_result || { label: job.prediction_label, confidence: job.confidence };
                             const vis = job.prediction_result ? job.prediction_result.visualisasi : null;
                             showInPreview(job.url, pred, job.llm_analysis, vis);
+                            showCandlingMetrics(job.metrics);
                         }
                         loadHistory();
                     } else if (job.status === 'failed') {
