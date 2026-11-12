@@ -16,6 +16,7 @@ Route::middleware(['device.key', 'throttle:120,1'])->prefix('device')->group(fun
 
 Route::prefix('incubator')->group(function () {
     Route::post('/upload', [IncubatorController::class, 'upload'])->middleware(['device.key', 'throttle:120,1']);
+    Route::post('/telemetry', [IncubatorController::class, 'telemetry'])->middleware(['device.key', 'throttle:120,1']);
     Route::get('/device-control', [IncubatorController::class, 'deviceControl'])->middleware(['device.key', 'throttle:120,1']);
     Route::get('/latest', [IncubatorController::class, 'latest']);
     Route::get('/history', [IncubatorController::class, 'history']);

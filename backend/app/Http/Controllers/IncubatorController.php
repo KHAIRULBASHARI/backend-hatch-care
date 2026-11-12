@@ -365,6 +365,37 @@ class IncubatorController extends Controller
     }
 
     /**
+     * Endpoint telemetri ringan via HTTP (fallback jika MQTT offline).
+     */
+    public function telemetry(Request $request)
+    {
+        $temp = $request->input('temperature') ?? $request->input('temp');
+        $humidity = $request->input('humidity') ?? $request->input('hum');
+        $lamp = $request->input('heater') ?? $request->input('lamp');
+        $motor = $request->input('motor');
+        $rssi = $request->input('rssi');
+
+        if ($temp !== null) {
+            Cache::put('incubator:temperature', round((float) $temp, 1), 3600);
+        }
+        if ($humidity !== null) {
+            Cache::put('incubator:humidity', round((float) $humidity, 1), 3600);
+        }
+        if ($lamp !== null) {
+            Cache::put('incubator:lamp', (bool) $lamp, 3600);
+        }
+        if ($motor !== null) {
+            Cache::put('incubator:motor', (bool) $motor, 3600);
+        }
+        if ($rssi !== null) {
+            Cache::put('incubator:rssi', (int) $rssi, 3600);
+        }
+        Cache::put('incubator:last_seen', now()->timestamp, 3600);
+
+        return response()->json(['status' => 'success', 'timestamp' => now()->timestamp]);
+    }
+
+    /**
      * Retrieve the latest incubator snapshot, telemetry, and 1-hour history.
      */
     public function latest(Request $request)

@@ -9,6 +9,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
 
     <style>
         :root {
@@ -1113,6 +1114,56 @@
             }
         });
 
+        function applyLiveTelemetry(data) {
+            if (!data) return;
+            const teleTemp = document.getElementById('tele-temp');
+            const teleHum = document.getElementById('tele-hum');
+            const t = data.temperature !== undefined && data.temperature !== null ? data.temperature : data.temp;
+            const h = data.humidity !== undefined && data.humidity !== null ? data.humidity : data.hum;
+            if (teleTemp && t !== null && t !== undefined) {
+                teleTemp.textContent = parseFloat(t).toFixed(1);
+            }
+            if (teleHum && h !== null && h !== undefined) {
+                teleHum.textContent = Math.round(h);
+            }
+
+            if (data.heater !== undefined || data.lamp !== undefined) {
+                const isHeater = !!(data.heater ?? data.lamp);
+                const teleLamp = document.getElementById('tele-lamp-status');
+                if (teleLamp) {
+                    teleLamp.className = isHeater ? 'badge-status badge-on' : 'badge-status badge-off';
+                    teleLamp.textContent = isHeater ? 'MENYALA (ON)' : 'MATI (OFF)';
+                }
+            }
+
+            if (data.motor !== undefined) {
+                const isMotor = !!data.motor;
+                const teleMotor = document.getElementById('tele-motor-status');
+                if (teleMotor) {
+                    teleMotor.className = isMotor ? 'badge-status badge-warn' : 'badge-status badge-off';
+                    teleMotor.textContent = isMotor ? 'SEDANG BERPUTAR' : 'STANDBY';
+                }
+            }
+
+            const incBadge = document.getElementById('inc-device-badge');
+            if (incBadge) {
+                incBadge.className = 'badge-status badge-on';
+                incBadge.textContent = 'ESP Inkubator: Online (MQTT ⚡)';
+            }
+
+            if (data.tempMin !== undefined && data.tempMax !== undefined) {
+                const range = document.getElementById('tele-setpoint-range');
+                if (range) range.textContent = `${parseFloat(data.tempMin).toFixed(1)} - ${parseFloat(data.tempMax).toFixed(1)}`;
+                if (typeof inputTempMin !== 'undefined' && document.activeElement !== inputTempMin) inputTempMin.value = data.tempMin;
+                if (typeof inputTempMax !== 'undefined' && document.activeElement !== inputTempMax) inputTempMax.value = data.tempMax;
+            }
+            if (data.lampMode) {
+                updateModeButtons(data.lampMode);
+                const modeEl = document.getElementById('tele-lamp-mode');
+                if (modeEl) modeEl.textContent = data.lampMode === 'auto' ? 'Auto (Termostat)' : (data.lampMode === 'on' ? 'Manual ON' : 'Manual OFF');
+            }
+        }
+
         async function pollIncubatorTelemetry() {
             try {
                 const res = await fetch('/incubator/latest');
@@ -1258,6 +1309,63 @@
 
         pollIncubatorTelemetry();
         setInterval(pollIncubatorTelemetry, 3000);
+
+        // MQTT WebSocket Live Real-Time Client (Cloudflare WSS Port 443)
+        let dashMqtt = null;
+        function initDashboardMqtt() {
+            if (typeof mqtt === 'undefined') return;
+            try {
+                dashMqtt = mqtt.connect('wss://mqtt.walker880.my.id:443/mqtt', {
+                    clientId: 'web_' + Math.random().toString(16).slice(2, 10),
+                    clean: true,
+                    connectTimeout: 5000,
+                    reconnectPeriod: 4000
+                });
+
+                dashMqtt.on('connect', () => {
+                    console.log('[MQTT-WSS] Terhubung ke broker MQTT cloud (Port 443)!');
+                    dashMqtt.subscribe('incubator/+/telemetry');
+                    dashMqtt.subscribe('incubator/telemetry');
+                    dashMqtt.subscribe('incubator/+/temperature');
+                    dashMqtt.subscribe('incubator/+/humidity');
+                    dashMqtt.subscribe('incubator/+/heater');
+                    dashMqtt.subscribe('incubator/+/motor');
+                });
+
+                dashMqtt.on('message', (topic, payload) => {
+                    const text = payload.toString();
+                    if (topic.endsWith('/telemetry') || topic === 'incubator/telemetry') {
+                        try {
+                            const data = JSON.parse(text);
+                            applyLiveTelemetry(data);
+                        } catch (e) {}
+                    } else if (topic.endsWith('/temperature') || topic === 'incubator/temperature') {
+                        const el = document.getElementById('tele-temp');
+                        if (el && text.length > 0) el.textContent = parseFloat(text).toFixed(1);
+                    } else if (topic.endsWith('/humidity') || topic === 'incubator/humidity') {
+                        const el = document.getElementById('tele-hum');
+                        if (el && text.length > 0) el.textContent = Math.round(parseFloat(text));
+                    } else if (topic.endsWith('/heater')) {
+                        const el = document.getElementById('tele-lamp-status');
+                        if (el) {
+                            const on = text === 'ON';
+                            el.className = on ? 'badge-status badge-on' : 'badge-status badge-off';
+                            el.textContent = on ? 'MENYALA (ON)' : 'MATI (OFF)';
+                        }
+                    } else if (topic.endsWith('/motor')) {
+                        const el = document.getElementById('tele-motor-status');
+                        if (el) {
+                            const run = text === 'RUNNING';
+                            el.className = run ? 'badge-status badge-warn' : 'badge-status badge-off';
+                            el.textContent = run ? 'SEDANG BERPUTAR' : 'STANDBY';
+                        }
+                    }
+                });
+            } catch (err) {
+                console.warn('[MQTT-WSS] Inisialisasi WebSocket MQTT dibatalkan:', err);
+            }
+        }
+        initDashboardMqtt();
 
         // Sliders binding
         const sliders = [

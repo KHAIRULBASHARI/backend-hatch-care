@@ -3,14 +3,17 @@
  * INKUBATOR PENETAS TELUR - ESP32-CAM (AI-Thinker, OV2640 / OV3660)
  *
  * Pembagian kerja dual-core:
- *   Core 1 (loop)      : web server lokal, DHT22, termostat, relay, motor, LCD.
- *   Core 0 (cloudTask) : upload foto + polling kontrol ke server.
+ *   Core 1 (loop)      : web server lokal, DHT22, termostat, relay, motor, LCD 20x4.
+ *   Core 0 (cloudTask) : upload foto + MQTT telemetri/kontrol ke server.
  *
- * Anti-lag jangka panjang:
- *   1. FastWebServer memotong batas tunggu socket kosong Chrome (preconnect) dari 5000 ms ke 200 ms.
- *   2. esp_wifi_set_ps(WIFI_PS_NONE) dipanggil setelah WiFi.begin() agar radio tidak masuk sleep.
- *   3. cameraMutex hanya dikunci saat jepret hardware (~0.5 s), TIDAK dikunci saat upload/poll HTTPS.
- *   4. Kamera dinyalakan on-demand (UXGA 1600x1200) lalu langsung camStop() sebelum kirim WiFi.
+ * Peningkatan & Tuning:
+ *   1. LCD 20x4 informatif: Suhu + Setpoint, Kelembaban + Mode, Hitung mundur putar telur, MQTT + WiFi RSSI.
+ *   2. Boot sinkron: Menunggu koneksi Wi-Fi, waktu NTP, dan handshake MQTT WSS total sebelum loop.
+ *   3. LED internal ESP32 dinonaktifkan: GPIO 33 dipaksa HIGH (mati) dan flash LED tidak dipaksa saat foto.
+ *   4. Pin I/O dipertahankan 100%: Heater (GPIO 4), Motor (GPIO 2), DHT (GPIO 15), I2C (14, 13).
+ *   5. Koordinasi Dinamo & Kamera: Pemotretan ditunda saat motor berputar (anti-blur & anti-drop voltase).
+ *   6. Filter Sanity DHT22: Menyaring glitch/spike nilai suhu palsu (15 - 50 °C).
+ *   7. Watchdog WiFi non-blocking di loop utama.
  * ====================================================================================
  */
 
@@ -59,12 +62,12 @@
   #define JPEG_QUALITY 4                    // Kualitas mentok tertinggi (4 = kompresi minimal, sangat tajam)
 #endif
 
-// Pin AI-Thinker
+// Pin AI-Thinker (DIJAGA TETAP SESUAI WIRING HARDWARE)
 #define PIN_I2C_SDA      14
 #define PIN_I2C_SCL      13
 #define PIN_DHT          15
-#define PIN_RELAY_HEATER 4    // berbagi dengan LED flash onboard
-#define PIN_RELAY_MOTOR  2
+#define PIN_RELAY_HEATER 4    // Relay pemanas
+#define PIN_RELAY_MOTOR  2    // Relay dinamo pembalik telur
 #define RELAY_ON         HIGH
 #define RELAY_OFF        LOW
 
@@ -87,14 +90,11 @@
 
 // Batas waktu & keamanan
 const uint32_t RELAY_MIN_SWITCH_MS   = 3000;   // relay minimal 3 s di satu status (anti-kedip cepat)
-const uint32_t PHOTO_LIGHT_HOLD_MS   = 3500;   // lampu warm & LED menyala 3.5 s saat jadwal foto tiba
-const uint32_t PHOTO_LIGHT_WARMUP_MS = 450;    // pemanasan filamen sebelum jepret
-const uint32_t SENSOR_SETTLE_MS      = 220;    // waktu stabilisasi AWB/AEC sensor
 const float    TEMP_HARD_LIMIT       = 40.5f;  // di atas ini lampu dipaksa mati, mode apa pun
 const uint32_t CONTROL_POLL_MS       = 3000;
 const uint32_t UPLOAD_MIN_S          = 15;     // mengikuti interval minimal di web (15 detik)
 const uint32_t UPLOAD_MAX_S          = 3600;
-const uint8_t  DHT_MAX_FAILS         = 3;      // NaN sesaat dari DHT tidak memutus relay
+const uint8_t  DHT_MAX_FAILS         = 3;      // NaN berulang dari DHT baru trigger error
 const int      CAPTURE_TRIES         = 3;
 
 enum LampMode : uint8_t { LAMP_AUTO, LAMP_ON, LAMP_OFF };
@@ -129,12 +129,12 @@ volatile float    currentTemp = NAN;
 volatile float    currentHum  = NAN;
 volatile bool     heaterState = false;
 volatile bool     isMotorRunning = false;
+volatile bool     telemetryRequested = false;
 
 volatile int      lastUploadCode  = 0;
 volatile uint32_t lastUploadTime  = 0;
 volatile uint32_t lastUploadBytes = 0;
 
-volatile uint32_t photoLightUntil   = 0;
 volatile uint32_t localWebBusyUntil = 0;
 bool     heaterPinOn = false;
 uint32_t heaterPinChangedAt = 0;
@@ -171,8 +171,7 @@ void applyHeaterPin() {
   bool overheat = isfinite(t) && t >= TEMP_HARD_LIMIT;
   bool tempValid = isfinite(t) && t > 0;
   bool canHeat = tempValid && !overheat && heaterState;
-  bool canLight = !overheat && (!tempValid || t < tempSetpointMax + 0.5f) &&
-                  (manualLight || (int32_t)(photoLightUntil - now) > 0);
+  bool canLight = !overheat && manualLight;
   bool want = canHeat || canLight;
   if (want == heaterPinOn) return;
   if (!overheat && heaterPinChangedAt != 0 && now - heaterPinChangedAt < RELAY_MIN_SWITCH_MS) return;
@@ -180,22 +179,13 @@ void applyHeaterPin() {
   heaterPinOn = want;
   heaterPinChangedAt = now;
   digitalWrite(PIN_RELAY_HEATER, want ? RELAY_ON : RELAY_OFF);
+  telemetryRequested = true;
 }
 
 void refreshHeaterPin() {
   portENTER_CRITICAL(&heaterMux);
   applyHeaterPin();
   portEXIT_CRITICAL(&heaterMux);
-}
-
-uint32_t requestPhotoLight() {
-  portENTER_CRITICAL(&heaterMux);
-  bool wasOn = heaterPinOn;
-  photoLightUntil = millis() + PHOTO_LIGHT_HOLD_MS;
-  applyHeaterPin();
-  bool nowOn = heaterPinOn;
-  portEXIT_CRITICAL(&heaterMux);
-  return (!wasOn && nowOn) ? PHOTO_LIGHT_WARMUP_MS : 0;
 }
 
 void updateThermostat() {
@@ -217,6 +207,7 @@ void updateMotor(uint32_t now) {
       digitalWrite(PIN_RELAY_MOTOR, RELAY_OFF);
       isMotorRunning = false;
       lastMotorTurn = now;
+      telemetryRequested = true;
       Serial.println("[MOTOR] selesai");
     }
     return;
@@ -226,6 +217,7 @@ void updateMotor(uint32_t now) {
     digitalWrite(PIN_RELAY_MOTOR, RELAY_ON);
     isMotorRunning = true;
     motorStartTime = now;
+    telemetryRequested = true;
     Serial.println("[MOTOR] berputar");
   }
 }
@@ -243,8 +235,6 @@ static camera_config_t makeConfig(framesize_t fs) {
   c.pin_pwdn = PWDN_GPIO_NUM; c.pin_reset = RESET_GPIO_NUM;
   c.xclk_freq_hz = 20000000;
   c.pixel_format = PIXFORMAT_JPEG;
-  // GRAB_WHEN_EMPTY + fb_count=1: DMA berhenti otomatis saat tidak memotret (WiFi kencang),
-  // tapi sensor tetap hidup sehingga Auto White Balance (AWB) tidak pernah reset jadi hijau.
   c.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
   bool psram = psramFound();
   c.frame_size   = psram ? fs : FRAMESIZE_SVGA;
@@ -283,7 +273,6 @@ bool camStart() {
     camera_config_t c = makeConfig(fs);
     if (esp_camera_init(&c) == ESP_OK) {
       tuneSensor();
-      // Buang beberapa frame saat start agar AWB selesai kalibrasi dari hijau ke warna normal
       for (int i = 0; i < 4; i++) {
         delay(80);
         camera_fb_t *fb = esp_camera_fb_get();
@@ -325,29 +314,19 @@ static bool saveToBuffer(PhotoBuffer &dst, const uint8_t *src, size_t len) {
   return true;
 }
 
-// Ambil foto UXGA ke buffer tujuan. Sensor tetap hidup (AWB tetap akurat/tidak hijau),
-// dan dengan fb_count=1 + GRAB_WHEN_EMPTY, DMA langsung berhenti setelah frame diambil.
 bool capturePhotoTo(PhotoBuffer &target) {
   if (xSemaphoreTake(cameraMutex, pdMS_TO_TICKS(5000)) != pdTRUE) return false;
 
-  uint32_t warmup = requestPhotoLight();
   if (!camStart()) {
     xSemaphoreGive(cameraMutex);
     return false;
   }
 
-  if (warmup) delay(warmup);
-
   bool ok = false;
   int qUsed = JPEG_QUALITY;
   for (int t = 0; t < CAPTURE_TRIES; t++) {
-    // Buang 1 frame lama di buffer tunggal (dan 1 frame lagi jika lampu baru menyala)
-    int flushCount = (warmup && t == 0) ? 2 : 1;
-    for (int i = 0; i < flushCount; i++) {
-      camera_fb_t *old = esp_camera_fb_get();
-      if (old) esp_camera_fb_return(old);
-      if (warmup) delay(60);
-    }
+    camera_fb_t *old = esp_camera_fb_get();
+    if (old) esp_camera_fb_return(old);
 
     camera_fb_t *fb = esp_camera_fb_get();
     if (jpegValid(fb)) {
@@ -367,7 +346,6 @@ bool capturePhotoTo(PhotoBuffer &target) {
   }
 
   if (!ok) {
-    // Reset hanya jika sensor gagal memberi frame valid
     camStop();
   }
   xSemaphoreGive(cameraMutex);
@@ -416,37 +394,51 @@ void applyCloudCommands(const String &json) {
     }
   }
 
-  if (const char *p = jsonValue(json, "lampMode")) {
-    if      (!strncmp(p, "\"on\"", 4))   lampMode = LAMP_ON;
-    else if (!strncmp(p, "\"off\"", 5))  lampMode = LAMP_OFF;
-    else if (!strncmp(p, "\"auto\"", 6)) lampMode = LAMP_AUTO;
-  }
-
-  const char *req = jsonValue(json, "motorManualRequest");
+  const char *mot = jsonValue(json, "motorManualRequest");
   const char *cmd = jsonValue(json, "motorCommandId");
-  if (req && !strncmp(req, "true", 4) && cmd && *cmd == '"') {
-    char id[sizeof(lastMotorCommandId)] = "";
-    const char *end = strchr(cmd + 1, '"');
-    size_t n = end ? (size_t)(end - cmd - 1) : 0;
-    if (n > 0 && n < sizeof(id)) {
-      memcpy(id, cmd + 1, n);
-      id[n] = '\0';
-      if (strcmp(id, lastMotorCommandId) != 0) {
-        Preferences prefs;
-        if (prefs.begin("incubator", false)) {
-          prefs.putString("lastMotorCmd", id);
-          prefs.end();
+  if (mot && !strncmp(mot, "true", 4)) {
+    bool isNew = true;
+    if (cmd && *cmd == '"') {
+      char id[sizeof(lastMotorCommandId)] = "";
+      const char *end = strchr(cmd + 1, '"');
+      size_t n = end ? (size_t)(end - cmd - 1) : 0;
+      if (n > 0 && n < sizeof(id)) {
+        memcpy(id, cmd + 1, n);
+        id[n] = '\0';
+        if (strcmp(id, lastMotorCommandId) == 0) {
+          isNew = false;
+        } else {
+          strcpy(lastMotorCommandId, id);
+          Preferences prefs;
+          if (prefs.begin("incubator", false)) {
+            prefs.putString("lastMotorCmd", lastMotorCommandId);
+            prefs.end();
+          }
         }
-        strcpy(lastMotorCommandId, id);
-        motorRequest = true;
       }
+    }
+    if (isNew && !isMotorRunning) {
+      motorRequest = true;
+      Serial.println("[CMD] Putar dinamo via Cloud!");
     }
   }
 
-  float v;
-  if (jsonNumber(json, "tempMin", v) && v >= 30 && v <= 45) tempSetpointMin = v;
-  if (jsonNumber(json, "tempMax", v) && v >= 30 && v <= 45) tempSetpointMax = v;
-  if (jsonNumber(json, "motorIntervalHours", v) && v >= 1 && v <= 24) motorIntervalMs = (uint32_t)v * 3600000UL;
+  const char *mode = jsonValue(json, "lampMode");
+  if (mode) {
+    if      (!strncmp(mode, "\"auto\"", 6)) lampMode = LAMP_AUTO;
+    else if (!strncmp(mode, "\"on\"",   4)) lampMode = LAMP_ON;
+    else if (!strncmp(mode, "\"off\"",  5)) lampMode = LAMP_OFF;
+    updateThermostat();
+  }
+
+  float v = 0;
+  if (jsonNumber(json, "tempMin", v) && v >= 20.0f && v <= 45.0f) tempSetpointMin = v;
+  if (jsonNumber(json, "tempMax", v) && v >= 20.0f && v <= 45.0f) tempSetpointMax = v;
+  if (tempSetpointMin >= tempSetpointMax) tempSetpointMin = tempSetpointMax - 0.5f;
+
+  if (jsonNumber(json, "motorIntervalHours", v) && v >= 0.5f && v <= 24.0f) {
+    motorIntervalMs = (uint32_t)(v * 3600000.0f);
+  }
   if (jsonNumber(json, "motorDurationSeconds", v) && v >= 1 && v <= 180) motorDurationMs = (uint32_t)v * 1000UL;
   if (jsonNumber(json, "captureIntervalSeconds", v)) {
     uint32_t s = constrain((uint32_t)v, UPLOAD_MIN_S, UPLOAD_MAX_S);
@@ -460,6 +452,8 @@ void applyCloudCommands(const String &json) {
       }
     }
   }
+
+  telemetryRequested = true;
 }
 
 // ─── CLOUD (Core 0, tidak pernah memblokir web lokal) ────────────────────────────
@@ -563,6 +557,10 @@ static void mqttEventHandler(void *handler_args, esp_event_base_t base, int32_t 
       mqttConnected = true;
       Serial.println("[MQTT] Terhubung ke Cloudflare WSS (Port 443)!");
       esp_mqtt_client_subscribe(mqttClient, MQTT_TOPIC_CONTROL, 1);
+      esp_mqtt_client_subscribe(mqttClient, "incubator/control", 1);
+      esp_mqtt_client_subscribe(mqttClient, "incubator/" DEVICE_KEY "/set", 1);
+      esp_mqtt_client_publish(mqttClient, "incubator/" DEVICE_KEY "/status", "{\"online\":true}", 0, 1, 1);
+      telemetryRequested = true;
       break;
 
     case MQTT_EVENT_DISCONNECTED:
@@ -600,10 +598,14 @@ void initMqtt() {
   mqtt_cfg.broker.address.transport = MQTT_TRANSPORT_OVER_WSS;
   mqtt_cfg.broker.address.path = "/mqtt";
   mqtt_cfg.broker.verification.crt_bundle_attach = esp_crt_bundle_attach;
-  // SNI wajib aktif (jangan skip common name) agar Cloudflare menerima TLS handshake
+  mqtt_cfg.session.last_will.topic = "incubator/" DEVICE_KEY "/status";
+  mqtt_cfg.session.last_will.msg = "{\"online\":false}";
+  mqtt_cfg.session.last_will.msg_len = 16;
+  mqtt_cfg.session.last_will.qos = 1;
+  mqtt_cfg.session.last_will.retain = 1;
   mqtt_cfg.task.stack_size = 10240;
-  mqtt_cfg.buffer.size = 512;
-  mqtt_cfg.buffer.out_size = 512;
+  mqtt_cfg.buffer.size = 1024;
+  mqtt_cfg.buffer.out_size = 1024;
   mqtt_cfg.network.reconnect_timeout_ms = 8000;
   mqtt_cfg.network.disable_auto_reconnect = false;
 
@@ -617,20 +619,50 @@ void initMqtt() {
   }
 }
 
+static int32_t secondsUntilTurn() {
+  uint32_t passed = millis() - lastMotorTurn;
+  return motorIntervalMs > passed ? (motorIntervalMs - passed) / 1000 : 0;
+}
+
 void publishTelemetry() {
   if (!mqttConnected || !mqttClient) return;
   float t = currentTemp, h = currentHum;
-  char json[280];
+  int32_t turnSec = secondsUntilTurn();
+  char json[384];
   snprintf(json, sizeof(json),
-    "{\"temp\":%s,\"hum\":%s,\"heater\":%s,\"lampMode\":\"%s\",\"motor\":%s,\"rssi\":%d}",
+    "{\"temp\":%s,\"temperature\":%s,\"hum\":%s,\"humidity\":%s,\"heater\":%s,\"lamp\":%s,\"lampMode\":\"%s\",\"motor\":%s,\"tempMin\":%.1f,\"tempMax\":%.1f,\"turnCountdownSec\":%ld,\"rssi\":%d,\"uptime\":%lu}",
+    isfinite(t) ? String(t, 1).c_str() : "null",
     isfinite(t) ? String(t, 1).c_str() : "null",
     isfinite(h) ? String((int)h).c_str() : "null",
+    isfinite(h) ? String((int)h).c_str() : "null",
+    heaterPinOn ? "true" : "false",
     heaterPinOn ? "true" : "false",
     LAMP_MODE_NAME[lampMode],
     isMotorRunning ? "true" : "false",
-    WiFi.RSSI()
+    (float)tempSetpointMin,
+    (float)tempSetpointMax,
+    (long)turnSec,
+    WiFi.RSSI(),
+    (unsigned long)(millis() / 1000UL)
   );
   esp_mqtt_client_publish(mqttClient, MQTT_TOPIC_TELEMETRY, json, 0, 0, 0);
+  esp_mqtt_client_publish(mqttClient, "incubator/telemetry", json, 0, 0, 0);
+
+  // Sub-topik spesifik agar mudah di-subscribe oleh IoT Dashboard / Home Assistant
+  if (isfinite(t)) {
+    char sVal[16];
+    snprintf(sVal, sizeof(sVal), "%.1f", t);
+    esp_mqtt_client_publish(mqttClient, "incubator/" DEVICE_KEY "/temperature", sVal, 0, 0, 0);
+    esp_mqtt_client_publish(mqttClient, "incubator/temperature", sVal, 0, 0, 0);
+  }
+  if (isfinite(h)) {
+    char sVal[16];
+    snprintf(sVal, sizeof(sVal), "%d", (int)h);
+    esp_mqtt_client_publish(mqttClient, "incubator/" DEVICE_KEY "/humidity", sVal, 0, 0, 0);
+    esp_mqtt_client_publish(mqttClient, "incubator/humidity", sVal, 0, 0, 0);
+  }
+  esp_mqtt_client_publish(mqttClient, "incubator/" DEVICE_KEY "/heater", heaterPinOn ? "ON" : "OFF", 0, 0, 0);
+  esp_mqtt_client_publish(mqttClient, "incubator/" DEVICE_KEY "/motor", isMotorRunning ? "RUNNING" : "STANDBY", 0, 0, 0);
 }
 
 void cloudPoll() {
@@ -657,13 +689,10 @@ void cloudPoll() {
 }
 
 void cloudTask(void *) {
-  delay(2000); // Tunggu Core 1 dan WiFi stabil sebelum inisialisasi MQTT
-  if (WiFi.status() == WL_CONNECTED) {
-    initMqtt();
-  }
+  delay(1000);
   uint32_t lastPoll = millis();
   uint32_t lastTelemetry = millis();
-  uint32_t lastUp = millis(); // Beri waktu MQTT handshake sebelum upload pertama
+  uint32_t lastUp = millis();
 
   for (;;) {
     uint32_t now = millis();
@@ -672,6 +701,17 @@ void cloudTask(void *) {
     if (!localBusy && WiFi.status() == WL_CONNECTED) {
       if (!mqttClient) {
         initMqtt();
+      }
+
+      // Tunda foto jika dinamo pembalik telur sedang berputar (anti-blur & anti-drop tegangan)
+      if (isMotorRunning) {
+        if (telemetryRequested || (now - lastTelemetry >= 2000)) {
+          telemetryRequested = false;
+          lastTelemetry = now;
+          publishTelemetry();
+        }
+        vTaskDelay(pdMS_TO_TICKS(200));
+        continue;
       }
 
       // 1. Manual Capture seketika jika diminta via MQTT / Web
@@ -687,8 +727,9 @@ void cloudTask(void *) {
         cloudUpload();
       }
 
-      // 3. Telemetri hemat kuota ke MQTT tiap 3 detik
-      if (now - lastTelemetry >= 3000) {
+      // 3. Telemetri full MQTT: seketika saat ada perubahan sensor/aktuator ATAU periodik tiap 2 detik
+      if (telemetryRequested || (now - lastTelemetry >= 2000)) {
+        telemetryRequested = false;
         lastTelemetry = now;
         publishTelemetry();
       }
@@ -704,11 +745,6 @@ void cloudTask(void *) {
 }
 
 // ─── WEB SERVER LOKAL (Core 1) ────────────────────────────────────────────────────
-static int32_t secondsUntilTurn() {
-  uint32_t passed = millis() - lastMotorTurn;
-  return motorIntervalMs > passed ? (motorIntervalMs - passed) / 1000 : 0;
-}
-
 static int32_t secondsSinceUpload() {
   return lastUploadTime ? (millis() - lastUploadTime) / 1000 : -1;
 }
@@ -777,6 +813,11 @@ void handleRoot() {
 
 void handleCapture() {
   localWebBusyUntil = millis() + 8000UL;
+  if (isMotorRunning) {
+    server.send(503, "text/plain", "Dinamo sedang memutar telur, harap tunggu...");
+    return;
+  }
+
   uint32_t t0 = millis();
   if (!capturePhotoTo(localPhoto) || !localPhoto.buf || localPhoto.len == 0) {
     server.send(500, "text/plain", "Gagal mengambil frame");
@@ -809,50 +850,47 @@ void handleCapture() {
 }
 
 void handleStatus() {
-  localWebBusyUntil = millis() + 6000UL;  // selama halaman lokal dibuka, tunda upload cloud
   float t = currentTemp, h = currentHum;
-  char json[480];
+  char json[320];
   snprintf(json, sizeof(json),
     "{\"temperature\":%s,\"humidity\":%s,\"heater\":%s,\"lamp_mode\":\"%s\","
-    "\"motor_running\":%s,\"next_turn_sec\":%ld,\"auto_upload_interval_sec\":%lu,"
-    "\"last_upload_code\":%d,\"last_upload_ago_sec\":%ld,\"rssi\":%d,\"ip\":\"%s\"}",
-    isfinite(t) ? String(t, 2).c_str() : "null", isfinite(h) ? String(h, 1).c_str() : "null",
+    "\"motor_running\":%s,\"seconds_until_turn\":%ld,\"last_upload_code\":%d,"
+    "\"last_upload_ago\":%ld,\"rssi\":%d}",
+    isfinite(t) ? String(t, 1).c_str() : "null",
+    isfinite(h) ? String((int)h).c_str() : "null",
     heaterPinOn ? "true" : "false", LAMP_MODE_NAME[lampMode],
     isMotorRunning ? "true" : "false", (long)secondsUntilTurn(),
-    (unsigned long)(uploadIntervalMs / 1000), lastUploadCode, (long)secondsSinceUpload(),
-    WiFi.RSSI(), WiFi.localIP().toString().c_str());
+    lastUploadCode, (long)secondsSinceUpload(), WiFi.RSSI());
+
   server.sendHeader("Access-Control-Allow-Origin", "*");
   server.send(200, "application/json", json);
 }
 
 void handleTurn() {
-  localWebBusyUntil = millis() + 6000UL;
   motorRequest = true;
-  server.sendHeader("Access-Control-Allow-Origin", "*");
-  server.send(200, "text/plain", "Dinamo pembalik telur diputar");
+  server.send(200, "text/plain", "Perintah putar dinamo diterima");
 }
 
 void handleLed() {
-  localWebBusyUntil = millis() + 6000UL;
-  manualLight = server.hasArg("state") ? server.arg("state").toInt() > 0 : !manualLight;
+  manualLight = !manualLight;
   refreshHeaterPin();
-  server.sendHeader("Access-Control-Allow-Origin", "*");
   server.send(200, "application/json", manualLight ? "{\"led\":true}" : "{\"led\":false}");
 }
 
-// ─── LCD 16x4 ─────────────────────────────────────────────────────────────────────
-char lcdCache[4][17];
+// ─── LCD 20x4 I2C (INFORMATIF) ────────────────────────────────────────────────────
+static char lcdCache[4][21]; // 20 kolom + null terminator
 
 void lcdLine(uint8_t row, const char *fmt, ...) {
-  char line[17];
+  if (!lcd || row >= 4) return;
+  char line[24];
   va_list ap;
   va_start(ap, fmt);
   int n = vsnprintf(line, sizeof(line), fmt, ap);
   va_end(ap);
-  for (int i = constrain(n, 0, 16); i < 16; i++) line[i] = ' ';
-  line[16] = '\0';
-  if (memcmp(line, lcdCache[row], 16) == 0) return;
-  memcpy(lcdCache[row], line, 17);
+  for (int i = constrain(n, 0, 20); i < 20; i++) line[i] = ' ';
+  line[20] = '\0';
+  if (memcmp(line, lcdCache[row], 20) == 0) return;
+  memcpy(lcdCache[row], line, 21);
   lcd->setCursor(0, row);
   lcd->print(line);
 }
@@ -860,16 +898,40 @@ void lcdLine(uint8_t row, const char *fmt, ...) {
 void updateLcd() {
   if (!lcd) return;
   float t = currentTemp, h = currentHum;
-  if (isfinite(t) && isfinite(h)) lcdLine(0, "T:%.1f%cC H:%d%%", t, 223, (int)h);
-  else                            lcdLine(0, "Sensor DHT ERROR");
-  lcdLine(1, "Lampu:%s [%s]", heaterPinOn ? "ON " : "OFF", LAMP_MODE_NAME[lampMode]);
-  if (isMotorRunning) lcdLine(2, "Dinamo: PUTAR");
-  else {
-    long m = secondsUntilTurn() / 60;
-    lcdLine(2, "Putar: %ldj %02ldm", m / 60, m % 60);
+
+  // Baris 0: Suhu Realtime & Target Rentang Setpoint (20 char)
+  // Contoh: "T:37.8°C Set:37.0-38.0"
+  if (isfinite(t)) {
+    lcdLine(0, "T:%.1f%cC Set:%.1f-%.1f", t, 223, (float)tempSetpointMin, (float)tempSetpointMax);
+  } else {
+    lcdLine(0, "T:--.-%cC Set:%.1f-%.1f", 223, (float)tempSetpointMin, (float)tempSetpointMax);
   }
-  if (lastUploadCode) lcdLine(3, "Up:%d IP:.%d", lastUploadCode, WiFi.localIP()[3]);
-  else                lcdLine(3, "%s", WiFi.localIP().toString().c_str());
+
+  // Baris 1: Kelembaban Realtime & Status Pemanas + Mode (20 char)
+  // Contoh: "H:62%   Lampu:ON [auto]"
+  if (isfinite(h)) {
+    lcdLine(1, "H:%d%%   Lampu:%s[%s]", (int)h, heaterPinOn ? "ON " : "OFF", LAMP_MODE_NAME[lampMode]);
+  } else {
+    lcdLine(1, "H:--%%   Lampu:%s[%s]", heaterPinOn ? "ON " : "OFF", LAMP_MODE_NAME[lampMode]);
+  }
+
+  // Baris 2: Dinamo Pembalik Telur (20 char)
+  // Contoh: "Dinamo: BERPUTAR... " atau "Putar Telur: 03j 45m"
+  if (isMotorRunning) {
+    lcdLine(2, "Dinamo: BERPUTAR... ");
+  } else {
+    long m = secondsUntilTurn() / 60;
+    lcdLine(2, "Putar Telur: %02ldj %02ldm", m / 60, m % 60);
+  }
+
+  // Baris 3: Status Cloud, MQTT & Sinyal WiFi (20 char)
+  // Contoh: "MQTT:OK  Up:200  -48dB"
+  const char *mStatus = mqttConnected ? "OK" : "OFF";
+  if (lastUploadCode > 0) {
+    lcdLine(3, "MQTT:%-3s Up:%-3d %3ddBm", mStatus, lastUploadCode, WiFi.RSSI());
+  } else {
+    lcdLine(3, "MQTT:%-3s IP: .%-3d %ddB", mStatus, WiFi.localIP()[3], WiFi.RSSI());
+  }
 }
 
 void initLcd() {
@@ -878,11 +940,12 @@ void initLcd() {
   for (uint8_t addr : {0x27, 0x3F}) {
     Wire.beginTransmission(addr);
     if (Wire.endTransmission() == 0) {
-      lcd = new LiquidCrystal_I2C(addr, 16, 4);
+      lcd = new LiquidCrystal_I2C(addr, 20, 4);
       lcd->init();
       lcd->backlight();
-      lcdLine(0, "INKUBATOR TELUR");
-      lcdLine(1, "Menyiapkan...");
+      memset(lcdCache, 0, sizeof(lcdCache));
+      lcdLine(0, "  INKUBATOR TELUR   ");
+      lcdLine(1, "   Inisialisasi...  ");
       return;
     }
   }
@@ -894,10 +957,15 @@ void setup() {
   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
   esp_log_level_set("gpio", ESP_LOG_NONE);
 
+  // Inisialisasi pin relay (TETAP SESUAI PIN ASLI)
   pinMode(PIN_RELAY_HEATER, OUTPUT);
   pinMode(PIN_RELAY_MOTOR, OUTPUT);
   digitalWrite(PIN_RELAY_HEATER, RELAY_OFF);
   digitalWrite(PIN_RELAY_MOTOR, RELAY_OFF);
+
+  // Nonaktifkan LED merah internal ESP32 (GPIO 33 active LOW pada AI-Thinker)
+  pinMode(33, OUTPUT);
+  digitalWrite(33, HIGH);
 
   Serial.begin(115200);
   Serial.println("\n[BOOT] Inkubator ESP32-CAM (UXGA 1600x1200)");
@@ -925,16 +993,64 @@ void setup() {
   WiFi.setAutoReconnect(true);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   WiFi.setTxPower(WIFI_POWER_19_5dBm);
-  esp_wifi_set_ps(WIFI_PS_NONE);  // wajib setelah WiFi.begin() agar modem tidak tidur saat idle
-
-  for (int i = 0; i < 30 && WiFi.status() != WL_CONNECTED; i++) delay(400);
   esp_wifi_set_ps(WIFI_PS_NONE);
+
+  if (lcd) {
+    lcdLine(0, "  INKUBATOR TELUR   ");
+    lcdLine(1, "Menghubungkan WiFi..");
+  }
+
+  for (int i = 0; i < 40 && WiFi.status() != WL_CONNECTED; i++) {
+    delay(300);
+    if (lcd && (i % 4 == 0)) {
+      char dots[21] = "Konek WiFi";
+      for (int d = 0; d < (i / 4) % 6; d++) strcat(dots, ".");
+      lcdLine(1, "%s", dots);
+    }
+  }
+  esp_wifi_set_ps(WIFI_PS_NONE);
+
   Serial.printf("[WIFI] %s %s (RSSI %d dBm)\n",
                 WiFi.status() == WL_CONNECTED ? "terhubung" : "offline",
                 WiFi.localIP().toString().c_str(), WiFi.RSSI());
 
   if (WiFi.status() == WL_CONNECTED) {
+    if (lcd) {
+      lcdLine(1, "WiFi: %s", WiFi.localIP().toString().c_str());
+      lcdLine(2, "Sinkron Waktu NTP...");
+    }
     configTime(7 * 3600, 0, "pool.ntp.org", "time.google.com");
+    delay(800);
+
+    // Boot sinkron: Tunggu MQTT handshake total
+    if (lcd) {
+      lcdLine(2, "Konek MQTT Cloud....");
+      lcdLine(3, "Menunggu broker WSS.");
+    }
+    initMqtt();
+
+    uint32_t mqttWait = millis();
+    while (!mqttConnected && (millis() - mqttWait < 12000)) {
+      delay(250);
+      Serial.print(".");
+    }
+
+    if (lcd) {
+      if (mqttConnected) {
+        lcdLine(2, "MQTT: TERHUBUNG OK! ");
+        lcdLine(3, "Memulai sistem......");
+      } else {
+        lcdLine(2, "MQTT: Offline (Auto)");
+        lcdLine(3, "Lanjut mode mandiri.");
+      }
+      delay(1200);
+    }
+  } else {
+    if (lcd) {
+      lcdLine(1, "WiFi Gagal Konek!   ");
+      lcdLine(2, "Mode Offline Standby");
+      delay(1500);
+    }
   }
 
   server.on("/", HTTP_GET, handleRoot);
@@ -957,17 +1073,21 @@ void loop() {
   server.handleClient();
   uint32_t now = millis();
 
+  // 1. Pembacaan Sensor DHT22 dengan filter range wajar
   if (now - lastSensor >= 2000) {
     lastSensor = now;
     float t = dht.readTemperature();
     float h = dht.readHumidity();
-    if (isfinite(t) && isfinite(h)) {
+    bool valid = isfinite(t) && isfinite(h) && (t >= 15.0f && t <= 50.0f) && (h >= 10.0f && h <= 100.0f);
+    if (valid) {
       currentTemp = t;
       currentHum = h;
       dhtFails = 0;
+      telemetryRequested = true;
     } else if (++dhtFails >= DHT_MAX_FAILS) {
       currentTemp = NAN;
       currentHum = NAN;
+      telemetryRequested = true;
     }
     updateThermostat();
   }
@@ -975,6 +1095,17 @@ void loop() {
   refreshHeaterPin();
   updateMotor(now);
 
+  // 2. Watchdog koneksi WiFi non-blocking
+  static uint32_t lastWifiCheck = 0;
+  if (now - lastWifiCheck >= 10000) {
+    lastWifiCheck = now;
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("[WIFI] Terputus, mencoba reconnect...");
+      WiFi.reconnect();
+    }
+  }
+
+  // 3. Refresh LCD 20x4
   if (now - lastLcd >= 1000) {
     lastLcd = now;
     updateLcd();
