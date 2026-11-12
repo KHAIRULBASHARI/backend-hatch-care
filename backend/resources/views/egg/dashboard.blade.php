@@ -1330,10 +1330,38 @@
                     dashMqtt.subscribe('incubator/+/humidity');
                     dashMqtt.subscribe('incubator/+/heater');
                     dashMqtt.subscribe('incubator/+/motor');
+                    dashMqtt.subscribe('candling/+/telemetry');
+                    dashMqtt.subscribe('candling/+/status');
                 });
 
                 dashMqtt.on('message', (topic, payload) => {
                     const text = payload.toString();
+                    if (topic.startsWith('candling/')) {
+                        const dot = document.getElementById('status-dot');
+                        const textEl = document.getElementById('status-text');
+                        const rssi = document.getElementById('telemetry-rssi');
+                        const last = document.getElementById('telemetry-last');
+                        try {
+                            const data = JSON.parse(text);
+                            if (data.online === true || data.job) {
+                                if (dot) dot.className = 'status-dot online';
+                                if (textEl) {
+                                    textEl.textContent = data.status === 'capturing' ? 'ESP Candling: Memotret...' : 'ESP Online (MQTT ⚡)';
+                                    textEl.style.color = 'var(--success)';
+                                }
+                                if (data.rssi !== undefined && rssi) rssi.textContent = `${data.rssi} dBm`;
+                                if (last) last.textContent = 'Baru saja';
+                            } else if (data.online === false) {
+                                if (dot) dot.className = 'status-dot offline';
+                                if (textEl) {
+                                    textEl.textContent = 'ESP Offline';
+                                    textEl.style.color = 'var(--danger)';
+                                }
+                            }
+                        } catch (e) {}
+                        return;
+                    }
+
                     if (topic.endsWith('/telemetry') || topic === 'incubator/telemetry') {
                         try {
                             const data = JSON.parse(text);

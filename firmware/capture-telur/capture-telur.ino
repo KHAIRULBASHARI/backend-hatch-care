@@ -483,6 +483,7 @@ static void mqttEventHandler(void *handler_args, esp_event_base_t base, int32_t 
       mqttConnected = true;
       Serial.println("[MQTT] Terhubung ke Cloudflare WSS (Port 443)!");
       esp_mqtt_client_subscribe(mqttClient, MQTT_TOPIC_JOB, 1);
+      esp_mqtt_client_publish(mqttClient, "candling/" DEVICE_KEY "/status", "{\"online\":true}", 0, 1, 1);
       break;
 
     case MQTT_EVENT_DISCONNECTED:
@@ -520,9 +521,14 @@ void initMqtt() {
   mqtt_cfg.broker.address.transport = MQTT_TRANSPORT_OVER_WSS;
   mqtt_cfg.broker.address.path = "/mqtt";
   mqtt_cfg.broker.verification.crt_bundle_attach = esp_crt_bundle_attach;
+  mqtt_cfg.session.last_will.topic = "candling/" DEVICE_KEY "/status";
+  mqtt_cfg.session.last_will.msg = "{\"online\":false}";
+  mqtt_cfg.session.last_will.msg_len = 16;
+  mqtt_cfg.session.last_will.qos = 1;
+  mqtt_cfg.session.last_will.retain = 1;
   mqtt_cfg.task.stack_size = 10240;
-  mqtt_cfg.buffer.size = 512;
-  mqtt_cfg.buffer.out_size = 512;
+  mqtt_cfg.buffer.size = 1024;
+  mqtt_cfg.buffer.out_size = 1024;
   mqtt_cfg.network.reconnect_timeout_ms = 8000;
   mqtt_cfg.network.disable_auto_reconnect = false;
 
@@ -549,6 +555,12 @@ void processPendingJob() {
 
   Serial.printf("[EXEC JOB %d] exp=%d gain=%d q=%d delay=%d\n", job, ev, gain, q, delayMs);
 
+  if (mqttConnected) {
+    char jobMsg[64];
+    snprintf(jobMsg, sizeof(jobMsg), "{\"job\":%d,\"status\":\"capturing\"}", job);
+    esp_mqtt_client_publish(mqttClient, MQTT_TOPIC_TELEMETRY, jobMsg, 0, 0, 0);
+  }
+
   uint8_t *img = NULL;
   size_t len = 0;
   unsigned long t0 = millis();
@@ -557,9 +569,19 @@ void processPendingJob() {
     Serial.printf("[JOB %d] foto %uKB dalam %lums\n", job, (unsigned)(len / 1024), millis() - t0);
     sendResult(job, img, len, false);
     if (img) free(img);
+    if (mqttConnected) {
+      char doneMsg[64];
+      snprintf(doneMsg, sizeof(doneMsg), "{\"job\":%d,\"status\":\"done\"}", job);
+      esp_mqtt_client_publish(mqttClient, MQTT_TOPIC_TELEMETRY, doneMsg, 0, 0, 0);
+    }
   } else {
     Serial.printf("[JOB %d] Gagal memotret, melapor ke server\n", job);
     sendResult(job, NULL, 0, true);
+    if (mqttConnected) {
+      char failMsg[64];
+      snprintf(failMsg, sizeof(failMsg), "{\"job\":%d,\"status\":\"failed\"}", job);
+      esp_mqtt_client_publish(mqttClient, MQTT_TOPIC_TELEMETRY, failMsg, 0, 0, 0);
+    }
   }
 }
 
@@ -644,6 +666,15 @@ void loop() {
   if (millis() - lastPoll >= pollInterval) {
     lastPoll = millis();
     pollServer();
+  }
+
+  // 3. Heartbeat telemetri MQTT tiap 5 detik
+  static uint32_t lastMqttHeartbeat = 0;
+  if (mqttConnected && millis() - lastMqttHeartbeat >= 5000) {
+    lastMqttHeartbeat = millis();
+    char tele[128];
+    snprintf(tele, sizeof(tele), "{\"online\":true,\"rssi\":%d,\"heap\":%u}", WiFi.RSSI(), ESP.getFreeHeap());
+    esp_mqtt_client_publish(mqttClient, MQTT_TOPIC_TELEMETRY, tele, 0, 0, 0);
   }
 
   delay(20);
