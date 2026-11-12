@@ -111,12 +111,12 @@ static camera_config_t makeConfig(framesize_t fs) {
   c.pin_reset    = RESET_GPIO_NUM;
   c.xclk_freq_hz = 20000000;
   c.pixel_format = PIXFORMAT_JPEG;
-  c.grab_mode    = CAMERA_GRAB_LATEST;
+  c.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
 
   if (psramFound()) {
     c.frame_size   = fs;
     c.jpeg_quality = JPEG_QUALITY;
-    c.fb_count     = 2;
+    c.fb_count     = 1;
     c.fb_location  = CAMERA_FB_IN_PSRAM;
   } else {
     c.frame_size   = FRAMESIZE_SVGA;
