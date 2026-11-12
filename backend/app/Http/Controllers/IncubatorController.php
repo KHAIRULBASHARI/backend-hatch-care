@@ -190,6 +190,12 @@ class IncubatorController extends Controller
         Cache::put('incubator:latest_url', $photoUrl, $cacheSeconds);
         Cache::put('incubator:last_seen', $timestamp, $cacheSeconds);
 
+        // Foto sudah berhasil di-upload, reset trigger capture agar tidak looping
+        Cache::forget('incubator:trigger_capture');
+        Cache::forget('incubator:capture_command_id');
+        $control['triggerCapture'] = false;
+        unset($control['captureCommandId']);
+
         return response()->json([
             'status' => 'success',
             'message' => 'Incubator snapshot saved',
@@ -246,40 +252,67 @@ class IncubatorController extends Controller
                 'motorDurationSeconds' => 'sometimes|required|integer|between:1,180',
                 'motorManualRequest' => 'sometimes|boolean',
                 'triggerMotor' => 'sometimes|boolean',
+                'triggerCapture' => 'sometimes|boolean',
+                'captureManual' => 'sometimes|boolean',
+                'action' => 'sometimes|string',
             ]);
 
-            $current = Cache::lock('incubator:control-lock', 10)->block(3, function () use ($request) {
+            $mqttPayload = [];
+
+            $current = Cache::lock('incubator:control-lock', 10)->block(3, function () use ($request, &$mqttPayload) {
                 $current = $this->controlSettings();
                 if ($request->has('lampMode')) {
                     $mode = strtolower((string) $request->input('lampMode'));
                     if (in_array($mode, ['auto', 'on', 'off'])) {
                         $current['lampMode'] = $mode;
+                        $mqttPayload['lampMode'] = $mode;
                     }
                 }
                 if ($request->has('motorManualRequest') || $request->has('triggerMotor')) {
                     $current['motorManualRequest'] = $request->boolean('motorManualRequest') || $request->boolean('triggerMotor');
                     $current['motorCommandId'] = $current['motorManualRequest'] ? (string) Str::uuid() : null;
+                    if ($current['motorManualRequest']) {
+                        $mqttPayload['motorManualRequest'] = true;
+                        $mqttPayload['motorCommandId'] = $current['motorCommandId'];
+                    }
+                }
+                if ($request->has('triggerCapture') || $request->has('captureManual') || $request->input('action') === 'capture') {
+                    $current['triggerCapture'] = true;
+                    $current['captureCommandId'] = (string) Str::uuid();
+                    $mqttPayload['action'] = 'capture';
+                    $mqttPayload['triggerCapture'] = true;
+                    $mqttPayload['captureCommandId'] = $current['captureCommandId'];
                 }
                 if ($request->has('tempMin')) {
                     $current['tempMin'] = round((float) $request->input('tempMin'), 1);
+                    $mqttPayload['tempMin'] = $current['tempMin'];
                 }
                 if ($request->has('tempMax')) {
                     $current['tempMax'] = round((float) $request->input('tempMax'), 1);
+                    $mqttPayload['tempMax'] = $current['tempMax'];
                 }
                 if ($request->has('motorIntervalHours')) {
                     $current['motorIntervalHours'] = (int) $request->input('motorIntervalHours');
+                    $mqttPayload['motorIntervalHours'] = $current['motorIntervalHours'];
                 }
                 if ($request->has('motorDurationSeconds')) {
                     $current['motorDurationSeconds'] = (int) $request->input('motorDurationSeconds');
+                    $mqttPayload['motorDurationSeconds'] = $current['motorDurationSeconds'];
                 }
                 if ($request->has('captureIntervalSeconds')) {
                     $current['captureIntervalSeconds'] = (int) $request->input('captureIntervalSeconds');
+                    $mqttPayload['captureIntervalSeconds'] = $current['captureIntervalSeconds'];
                 }
 
                 Cache::forever('incubator:control', $current);
 
                 return $current;
             });
+
+            // Kirim notifikasi realtime via MQTT jika ada payload kontrol
+            if (!empty($mqttPayload)) {
+                $this->publishMqttControl($mqttPayload);
+            }
 
             return response()->json([
                 'status' => 'success',
@@ -292,6 +325,25 @@ class IncubatorController extends Controller
             'status' => 'success',
             'control' => $this->controlSettings(),
         ]);
+    }
+
+    /**
+     * Publish perintah kontrol ke broker MQTT lokal (port 1883)
+     */
+    private function publishMqttControl(array $payload): void
+    {
+        try {
+            $deviceKey = config('services.device.key') ?? env('DEVICE_KEY', 'EggCamSecretKey_9876543210_abcdef1234567890');
+            $topic = 'incubator/' . $deviceKey . '/control';
+            $json = json_encode($payload, JSON_UNESCAPED_SLASHES);
+            if (function_exists('exec')) {
+                $escapedJson = escapeshellarg($json);
+                $escapedTopic = escapeshellarg($topic);
+                @exec("mosquitto_pub -h 127.0.0.1 -p 1883 -t {$escapedTopic} -m {$escapedJson} > /dev/null 2>&1 &");
+            }
+        } catch (\Throwable $e) {
+            // Silently fall back to cache polling
+        }
     }
 
     public function deviceControl(Request $request)

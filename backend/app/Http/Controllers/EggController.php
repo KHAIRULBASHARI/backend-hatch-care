@@ -27,7 +27,42 @@ class EggController extends Controller
 
         $job = CaptureJob::create($jobData);
 
+        // Broadcast perintah via MQTT realtime ke broker lokal port 1883
+        $this->publishMqttJob($job);
+
         return response()->json(['job' => $job->id]);
+    }
+
+    /**
+     * Publish perintah capture candling ke broker MQTT lokal (port 1883)
+     */
+    private function publishMqttJob(CaptureJob $job): void
+    {
+        try {
+            $deviceKey = config('services.device.key') ?? env('DEVICE_KEY', 'EggCamSecretKey_9876543210_abcdef1234567890');
+            $topic = 'candling/' . $deviceKey . '/job';
+            $payload = [
+                'job' => $job->id,
+                'exp' => $job->exposure ?? 500,
+                'gain' => $job->gain ?? 0,
+                'q' => $job->quality ?? 4,
+                'delay' => $job->settle_ms ?? 250,
+            ];
+            $json = json_encode($payload, JSON_UNESCAPED_SLASHES);
+            if (function_exists('exec')) {
+                $escapedJson = escapeshellarg($json);
+                $escapedTopic = escapeshellarg($topic);
+                @exec("mosquitto_pub -h 127.0.0.1 -p 1883 -t {$escapedTopic} -m {$escapedJson} > /dev/null 2>&1 &");
+            }
+
+            // Tandai status taken seketika agar web tracker langsung mendeteksi proses foto
+            $job->update([
+                'status' => 'taken',
+                'taken_at' => now(),
+            ]);
+        } catch (\Throwable $e) {
+            Log::warning('Gagal publish MQTT candling job: ' . $e->getMessage());
+        }
     }
 
     public function upload(Request $request)
@@ -158,7 +193,7 @@ class EggController extends Controller
         $ago = $last !== null ? (now()->timestamp - (int) $last) : null;
 
         return response()->json([
-            'online' => ($ago !== null && $ago < 15),
+            'online' => ($ago !== null && $ago < 25),
             'last_seen_sec' => $ago,
             'rssi' => Cache::get('device:rssi'),
         ]);

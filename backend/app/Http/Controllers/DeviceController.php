@@ -59,8 +59,13 @@ class DeviceController extends Controller
         $jobId = $request->query('job');
         $job = CaptureJob::findOrFail($jobId);
 
-        if ($job->status !== 'taken') {
-            abort(409, 'Job is not in taken status.');
+        if ($job->status !== 'taken' && $job->status !== 'pending') {
+            abort(409, 'Job is not in taken or pending status.');
+        }
+
+        Cache::put('device:last_seen', now()->timestamp, 3600);
+        if ($request->hasHeader('X-RSSI')) {
+            Cache::put('device:rssi', (int) $request->header('X-RSSI'), 3600);
         }
 
         if ($request->boolean('fail')) {
