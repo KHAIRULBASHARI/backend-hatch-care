@@ -27,6 +27,8 @@
 #include "esp_log.h"
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
+#include "mqtt_client.h"
+#include "esp_crt_bundle.h"
 
 // ─── KONFIGURASI ──────────────────────────────────────────────────────────────────
 #if __has_include("secrets.h")
@@ -39,16 +41,22 @@
   #define WIFI_PASS  "12345678"
 #endif
 #ifndef SERVER_URL
-  #define SERVER_URL "https://iot.walker880.my.id"
+  #define SERVER_URL "http://iot.walker880.my.id"
+#endif
+#ifndef MQTT_BROKER_URI
+  #define MQTT_BROKER_URI "wss://mqtt.walker880.my.id:443/mqtt"
 #endif
 #ifndef DEVICE_KEY
   #define DEVICE_KEY "EggCamSecretKey_9876543210_abcdef1234567890"
 #endif
+
+#define MQTT_TOPIC_CONTROL    "incubator/" DEVICE_KEY "/control"
+#define MQTT_TOPIC_TELEMETRY  "incubator/" DEVICE_KEY "/telemetry"
 #ifndef CAMERA_FRAME_SIZE
-  #define CAMERA_FRAME_SIZE FRAMESIZE_UXGA  // 1600x1200 (resolusi maksimal OV2640)
+  #define CAMERA_FRAME_SIZE FRAMESIZE_UXGA  // 1600x1200 (UXGA)
 #endif
 #ifndef JPEG_QUALITY
-  #define JPEG_QUALITY 10                   // Kualitas tinggi (makin kecil makin tajam)
+  #define JPEG_QUALITY 4                    // Kualitas mentok tertinggi (4 = kompresi minimal, sangat tajam)
 #endif
 
 // Pin AI-Thinker
@@ -115,6 +123,7 @@ volatile uint32_t motorDurationMs   = 15000UL;
 volatile uint32_t uploadIntervalMs  = 120000UL;
 volatile bool     motorRequest      = false;
 volatile bool     manualLight       = false;
+volatile bool     manualCaptureRequest = false;
 
 volatile float    currentTemp = NAN;
 volatile float    currentHum  = NAN;
@@ -133,6 +142,7 @@ uint32_t motorStartTime = 0;
 uint32_t lastMotorTurn  = 0;
 
 char     lastMotorCommandId[48] = "";
+char     lastCaptureCommandId[48] = "";
 uint32_t storedUploadSeconds = 120;
 
 portMUX_TYPE      heaterMux   = portMUX_INITIALIZER_UNLOCKED;
@@ -249,25 +259,26 @@ void tuneSensor() {
   if (!s) return;
   s->set_whitebal(s, 1);
   s->set_awb_gain(s, 1);
-  s->set_wb_mode(s, 0);               // Auto White Balance
-  s->set_exposure_ctrl(s, 1);
-  s->set_aec2(s, 0);                  // Matikan DSP aec2 (penyebab bayangan terangkat jadi hijau)
-  s->set_ae_level(s, 0);              // Level eksposur netral agar hitam tetap hitam pekat
+  s->set_wb_mode(s, 0);                  // Auto White Balance
+  s->set_exposure_ctrl(s, 1);            // Auto Exposure aktif
+  s->set_aec2(s, 0);                     // Matikan DSP aec2 (penyebab bayangan terangkat jadi hijau)
+  s->set_ae_level(s, -2);                // Target eksposur -2: cegah cangkang putih silau/overexposed, detail retakan tajam
   s->set_gain_ctrl(s, 1);
-  s->set_gainceiling(s, GAINCEILING_2X); // Batasi gain 2X (menghilangkan noise & garis hijau)
-  s->set_bpc(s, 1);
-  s->set_wpc(s, 1);
+  s->set_gainceiling(s, GAINCEILING_2X); // Batasi gain 2X (menghilangkan noise)
+  s->set_bpc(s, 1);                      // Bad pixel correction
+  s->set_wpc(s, 1);                      // White pixel correction
   s->set_raw_gma(s, 1);
-  s->set_lenc(s, 1);
-  s->set_brightness(s, 0);            // 0 = warna natural (1 membuat gelap jadi abu-hijau)
-  s->set_contrast(s, 0);
-  s->set_saturation(s, s->id.PID == OV3660_PID ? -1 : 0);
+  s->set_lenc(s, 1);                     // Koreksi vignetting lensa sudut
+  s->set_brightness(s, -1);              // Kecerahan -1 agar highlight cangkang tidak terbakar/washed out
+  s->set_contrast(s, 1);                 // Kontras seimbang (+1) memperjelas garis retak tanpa memotong highlight
+  s->set_saturation(s, 1);               // Saturasi warna hidup (+1)
+  s->set_sharpness(s, 2);                // Ketajaman maksimal (+2) untuk menonjolkan garis tepi dan retakan
   s->set_vflip(s, 1);
 }
 
 bool camStart() {
   if (camUp) return true;
-  const framesize_t sizes[] = {CAMERA_FRAME_SIZE, FRAMESIZE_SXGA, FRAMESIZE_XGA, FRAMESIZE_SVGA};
+  const framesize_t sizes[] = {FRAMESIZE_UXGA, FRAMESIZE_SXGA, FRAMESIZE_XGA, FRAMESIZE_SVGA};
   for (framesize_t fs : sizes) {
     camera_config_t c = makeConfig(fs);
     if (esp_camera_init(&c) == ESP_OK) {
@@ -278,6 +289,7 @@ bool camStart() {
         camera_fb_t *fb = esp_camera_fb_get();
         if (fb) esp_camera_fb_return(fb);
       }
+      Serial.printf("[CAM] siap di framesize=%d quality=%d\n", (int)fs, (int)c.jpeg_quality);
       return camUp = true;
     }
     esp_camera_deinit();
@@ -327,6 +339,7 @@ bool capturePhotoTo(PhotoBuffer &target) {
   if (warmup) delay(warmup);
 
   bool ok = false;
+  int qUsed = JPEG_QUALITY;
   for (int t = 0; t < CAPTURE_TRIES; t++) {
     // Buang 1 frame lama di buffer tunggal (dan 1 frame lagi jika lampu baru menyala)
     int flushCount = (warmup && t == 0) ? 2 : 1;
@@ -343,7 +356,14 @@ bool capturePhotoTo(PhotoBuffer &target) {
       break;
     }
     if (fb) esp_camera_fb_return(fb);
+    qUsed = min(qUsed + 2, 12);
+    sensor_t *s = esp_camera_sensor_get();
+    if (s) s->set_quality(s, qUsed);
     delay(60);
+  }
+  if (qUsed != JPEG_QUALITY) {
+    sensor_t *s = esp_camera_sensor_get();
+    if (s) s->set_quality(s, JPEG_QUALITY);
   }
 
   if (!ok) {
@@ -370,6 +390,32 @@ static bool jsonNumber(const String &json, const char *key, float &out) {
 }
 
 void applyCloudCommands(const String &json) {
+  // Manual capture via MQTT / Web (deduplikasi ID agar tidak looping)
+  const char *capReq = jsonValue(json, "triggerCapture");
+  const char *capAct = jsonValue(json, "action");
+  const char *capCmd = jsonValue(json, "captureCommandId");
+  if ((capReq && !strncmp(capReq, "true", 4)) || (capAct && !strncmp(capAct, "\"capture\"", 9))) {
+    bool isNew = true;
+    if (capCmd && *capCmd == '"') {
+      char id[sizeof(lastCaptureCommandId)] = "";
+      const char *end = strchr(capCmd + 1, '"');
+      size_t n = end ? (size_t)(end - capCmd - 1) : 0;
+      if (n > 0 && n < sizeof(id)) {
+        memcpy(id, capCmd + 1, n);
+        id[n] = '\0';
+        if (strcmp(id, lastCaptureCommandId) == 0) {
+          isNew = false;
+        } else {
+          strcpy(lastCaptureCommandId, id);
+        }
+      }
+    }
+    if (isNew && !manualCaptureRequest) {
+      manualCaptureRequest = true;
+      Serial.println("[CMD] Manual capture foto dipicu!");
+    }
+  }
+
   if (const char *p = jsonValue(json, "lampMode")) {
     if      (!strncmp(p, "\"on\"", 4))   lampMode = LAMP_ON;
     else if (!strncmp(p, "\"off\"", 5))  lampMode = LAMP_OFF;
@@ -425,40 +471,79 @@ void cloudUpload() {
   }
   uint32_t captureMs = millis() - t0;
 
-  // Batalkan upload jika user baru saja menekan tombol di web lokal
   if ((int32_t)(localWebBusyUntil - millis()) > 0) return;
 
-  WiFiClientSecure sclient;
-  WiFiClient       pclient;
-  HTTPClient       http;
-  String url = String(SERVER_URL) + "/api/incubator/upload";
+  uint32_t t1 = millis();
+  WiFiClient client;
+  client.setNoDelay(true);
+  client.setTimeout(6000);
 
-  if (useTls()) {
-    sclient.setInsecure();
-    sclient.setTimeout(12);
-    http.begin(sclient, url);
-  } else {
-    http.begin(pclient, url);
+  if (!client.connect("iot.walker880.my.id", 80)) {
+    Serial.println("[UPLOAD] Gagal connect ke server");
+    return;
   }
 
-  http.setTimeout(15000);
-  http.addHeader("X-Device-Key", DEVICE_KEY);
-  http.addHeader("Content-Type", "image/jpeg");
-  http.addHeader("X-RSSI", String(WiFi.RSSI()));
+  // 1. Header HTTP non-blocking dengan Connection: close
   float t = currentTemp, h = currentHum;
-  if (isfinite(t) && t > 0) http.addHeader("X-Temp", String(t, 1));
-  else                      http.addHeader("X-Temp-Valid", "0");
-  if (isfinite(h))          http.addHeader("X-Humidity", String(h, 1));
-  else                      http.addHeader("X-Humidity-Valid", "0");
-  http.addHeader("X-Lamp", heaterState ? "1" : "0");
-  http.addHeader("X-Motor", isMotorRunning ? "1" : "0");
+  client.print("POST /api/incubator/upload HTTP/1.1\r\n");
+  client.print("Host: iot.walker880.my.id\r\n");
+  client.print("User-Agent: ESP32HTTPClient\r\n");
+  client.print("X-Device-Key: " DEVICE_KEY "\r\n");
+  client.print("Content-Type: image/jpeg\r\n");
+  client.printf("Content-Length: %u\r\n", cloudPhoto.len);
+  client.printf("X-RSSI: %d\r\n", WiFi.RSSI());
+  if (isfinite(t) && t > 0) client.printf("X-Temp: %.1f\r\n", t);
+  else                      client.print("X-Temp-Valid: 0\r\n");
+  if (isfinite(h))          client.printf("X-Humidity: %.1f\r\n", h);
+  else                      client.print("X-Humidity-Valid: 0\r\n");
+  client.printf("X-Lamp: %d\r\n", heaterState ? 1 : 0);
+  client.printf("X-Motor: %d\r\n", isMotorRunning ? 1 : 0);
+  client.print("Connection: close\r\n\r\n");
 
-  uint32_t t1 = millis();
-  int code = http.POST(cloudPhoto.buf, cloudPhoto.len);
+  // 2. Kirim Buffer Foto dalam chunk 2048 byte tanpa macet di buffer lwIP
+  size_t remaining = cloudPhoto.len;
+  size_t offset = 0;
+  while (remaining > 0 && client.connected()) {
+    size_t toSend = (remaining > 2048) ? 2048 : remaining;
+    size_t written = client.write(cloudPhoto.buf + offset, toSend);
+    if (written > 0) {
+      offset += written;
+      remaining -= written;
+    } else {
+      delay(5);
+    }
+  }
+
+  // 3. Baca Status & Response dengan cepat
+  uint32_t waitResp = millis();
+  while (client.connected() && !client.available() && millis() - waitResp < 4000) {
+    delay(10);
+  }
+
+  int code = -1;
+  String statusLine = client.readStringUntil('\n');
+  if (statusLine.startsWith("HTTP/1.")) {
+    code = statusLine.substring(9, 12).toInt();
+  }
+
+  // Lewati HTTP Header
+  while (client.connected()) {
+    String line = client.readStringUntil('\n');
+    if (line == "\r" || line.length() == 0) break;
+  }
+
+  // Baca Response Body untuk perintah balik jika ada
+  String body = "";
+  while (client.available()) {
+    body += (char)client.read();
+  }
+  client.stop();
+
   uint32_t sendMs = millis() - t1;
 
-  if (code == 200 || code == 201) applyCloudCommands(http.getString());
-  http.end();
+  if (code == 200 || code == 201) {
+    applyCloudCommands(body);
+  }
 
   lastUploadCode  = code;
   lastUploadTime  = millis();
@@ -467,7 +552,89 @@ void cloudUpload() {
                 code, (unsigned)(cloudPhoto.len / 1024), captureMs, sendMs);
 }
 
+// ─── MQTT PROTOKOL REALTIME (Cloudflare WSS Port 443) ─────────────────────────────
+esp_mqtt_client_handle_t mqttClient = nullptr;
+volatile bool mqttConnected = false;
+
+static void mqttEventHandler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data) {
+  esp_mqtt_event_handle_t event = (esp_mqtt_event_handle_t)event_data;
+  switch ((esp_mqtt_event_id_t)event_id) {
+    case MQTT_EVENT_CONNECTED:
+      mqttConnected = true;
+      Serial.println("[MQTT] Terhubung ke Cloudflare WSS (Port 443)!");
+      esp_mqtt_client_subscribe(mqttClient, MQTT_TOPIC_CONTROL, 1);
+      break;
+
+    case MQTT_EVENT_DISCONNECTED:
+      mqttConnected = false;
+      Serial.println("[MQTT] Terputus, auto-reconnect aktif...");
+      break;
+
+    case MQTT_EVENT_DATA: {
+      if (event->data && event->data_len > 0) {
+        char payload[512] = {0};
+        int dlen = min((int)sizeof(payload) - 1, event->data_len);
+        memcpy(payload, event->data, dlen);
+        payload[dlen] = '\0';
+        Serial.printf("[MQTT RECV] %s\n", payload);
+        applyCloudCommands(String(payload));
+      }
+      break;
+    }
+
+    case MQTT_EVENT_ERROR:
+      Serial.println("[MQTT] Terjadi event error");
+      break;
+
+    default:
+      break;
+  }
+}
+
+void initMqtt() {
+  if (mqttClient) return;
+  Serial.printf("[MQTT] Inisialisasi... Free Heap: %u\n", ESP.getFreeHeap());
+  esp_mqtt_client_config_t mqtt_cfg = {};
+  mqtt_cfg.broker.address.hostname = "mqtt.walker880.my.id";
+  mqtt_cfg.broker.address.port = 443;
+  mqtt_cfg.broker.address.transport = MQTT_TRANSPORT_OVER_WSS;
+  mqtt_cfg.broker.address.path = "/mqtt";
+  mqtt_cfg.broker.verification.crt_bundle_attach = esp_crt_bundle_attach;
+  // SNI wajib aktif (jangan skip common name) agar Cloudflare menerima TLS handshake
+  mqtt_cfg.task.stack_size = 10240;
+  mqtt_cfg.buffer.size = 512;
+  mqtt_cfg.buffer.out_size = 512;
+  mqtt_cfg.network.reconnect_timeout_ms = 8000;
+  mqtt_cfg.network.disable_auto_reconnect = false;
+
+  mqttClient = esp_mqtt_client_init(&mqtt_cfg);
+  if (mqttClient) {
+    esp_mqtt_client_register_event(mqttClient, MQTT_EVENT_ANY, mqttEventHandler, NULL);
+    esp_err_t err = esp_mqtt_client_start(mqttClient);
+    Serial.printf("[MQTT] Client dimulai (err: %d)\n", (int)err);
+  } else {
+    Serial.println("[MQTT] Gagal alokasi client");
+  }
+}
+
+void publishTelemetry() {
+  if (!mqttConnected || !mqttClient) return;
+  float t = currentTemp, h = currentHum;
+  char json[280];
+  snprintf(json, sizeof(json),
+    "{\"temp\":%s,\"hum\":%s,\"heater\":%s,\"lampMode\":\"%s\",\"motor\":%s,\"rssi\":%d}",
+    isfinite(t) ? String(t, 1).c_str() : "null",
+    isfinite(h) ? String((int)h).c_str() : "null",
+    heaterPinOn ? "true" : "false",
+    LAMP_MODE_NAME[lampMode],
+    isMotorRunning ? "true" : "false",
+    WiFi.RSSI()
+  );
+  esp_mqtt_client_publish(mqttClient, MQTT_TOPIC_TELEMETRY, json, 0, 0, 0);
+}
+
 void cloudPoll() {
+  if (mqttConnected) return; // Prioritas MQTT: jangan polling HTTP jika MQTT terhubung
   WiFiClientSecure sclient;
   WiFiClient       pclient;
   HTTPClient       http;
@@ -483,28 +650,51 @@ void cloudPoll() {
   }
 
   http.setTimeout(4000);
+  http.setUserAgent("ESP32HTTPClient");
   http.addHeader("X-Device-Key", DEVICE_KEY);
   if (http.GET() == 200) applyCloudCommands(http.getString());
   http.end();
 }
 
 void cloudTask(void *) {
-  // Tarik pengaturan interval & mode lampu dari web terlebih dahulu saat boot
+  delay(2000); // Tunggu Core 1 dan WiFi stabil sebelum inisialisasi MQTT
   if (WiFi.status() == WL_CONNECTED) {
-    cloudPoll();
+    initMqtt();
   }
   uint32_t lastPoll = millis();
-  uint32_t lastUp = millis() - uploadIntervalMs + 8000UL;  // foto pertama 8 s setelah boot, lalu ikut interval web
+  uint32_t lastTelemetry = millis();
+  uint32_t lastUp = millis(); // Beri waktu MQTT handshake sebelum upload pertama
 
   for (;;) {
     uint32_t now = millis();
     bool localBusy = (int32_t)(localWebBusyUntil - now) > 0;
+
     if (!localBusy && WiFi.status() == WL_CONNECTED) {
-      if (now - lastUp >= uploadIntervalMs) {
+      if (!mqttClient) {
+        initMqtt();
+      }
+
+      // 1. Manual Capture seketika jika diminta via MQTT / Web
+      if (manualCaptureRequest) {
+        manualCaptureRequest = false;
+        Serial.println("[UPLOAD] Menjalankan manual capture...");
+        cloudUpload();
+        lastUp = now;
+      }
+      // 2. Upload periodik otomatis (15s - 120s)
+      else if (now - lastUp >= uploadIntervalMs) {
         lastUp = now;
         cloudUpload();
-        lastPoll = millis();
-      } else if (now - lastPoll >= CONTROL_POLL_MS) {
+      }
+
+      // 3. Telemetri hemat kuota ke MQTT tiap 3 detik
+      if (now - lastTelemetry >= 3000) {
+        lastTelemetry = now;
+        publishTelemetry();
+      }
+
+      // 4. Fallback HTTP polling HANYA jika MQTT terputus
+      if (!mqttConnected && (now - lastPoll >= 10000)) {
         lastPoll = now;
         cloudPoll();
       }
@@ -743,6 +933,10 @@ void setup() {
                 WiFi.status() == WL_CONNECTED ? "terhubung" : "offline",
                 WiFi.localIP().toString().c_str(), WiFi.RSSI());
 
+  if (WiFi.status() == WL_CONNECTED) {
+    configTime(7 * 3600, 0, "pool.ntp.org", "time.google.com");
+  }
+
   server.on("/", HTTP_GET, handleRoot);
   server.on("/capture", HTTP_GET, handleCapture);
   server.on("/status", HTTP_GET, handleStatus);
@@ -752,7 +946,8 @@ void setup() {
   server.begin();
 
   lastMotorTurn = millis();
-  xTaskCreatePinnedToCore(cloudTask, "cloud", 12288, NULL, 1, NULL, 0);
+  Serial.printf("[INIT] Free Heap: %u, Free PSRAM: %u\n", ESP.getFreeHeap(), ESP.getFreePsram());
+  xTaskCreatePinnedToCore(cloudTask, "cloud", 16384, NULL, 1, NULL, 0);
 }
 
 void loop() {
