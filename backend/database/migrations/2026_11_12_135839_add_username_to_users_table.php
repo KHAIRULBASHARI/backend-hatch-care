@@ -12,7 +12,10 @@ return new class extends Migration
     public function up(): void
     {
         Schema::table('users', function (Blueprint $table) {
-            $table->string('username')->unique()->after('name');
+            // Nullable agar aman untuk database lama yang sudah punya baris
+            // user (SQLite/MySQL menolak ADD NOT NULL UNIQUE tanpa default).
+            // Username tetap wajib diisi lewat validasi endpoint /api/register.
+            $table->string('username')->nullable()->unique()->after('name');
         });
     }
 
