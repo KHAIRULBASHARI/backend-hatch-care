@@ -93,6 +93,7 @@ const uint32_t RELAY_MIN_SWITCH_MS   = 3000;   // relay minimal 3 s di satu stat
 const float    TEMP_HARD_LIMIT       = 40.5f;  // di atas ini lampu dipaksa mati, mode apa pun
 const uint32_t UPLOAD_MIN_S          = 15;     // mengikuti interval minimal di web (15 detik)
 const uint32_t UPLOAD_MAX_S          = 3600;
+const uint32_t UPLOAD_TIMEOUT_MS     = 12000;
 const uint8_t  DHT_MAX_FAILS         = 3;      // NaN berulang dari DHT baru trigger error
 const int      CAPTURE_TRIES         = 3;
 
@@ -476,7 +477,7 @@ void cloudUpload() {
   client.setNoDelay(true);
   client.setTimeout(6000);
 
-  if (!client.connect("iot.walker880.my.id", 80)) {
+  if (!client.connect("iot.walker880.my.id", 80, 4000)) {
     Serial.println("[UPLOAD] Gagal connect ke server");
     return;
   }
@@ -493,7 +494,7 @@ void cloudUpload() {
   // 2. Kirim Buffer Foto dalam chunk 2048 byte tanpa macet di buffer lwIP
   size_t remaining = cloudPhoto.len;
   size_t offset = 0;
-  while (remaining > 0 && client.connected()) {
+  while (remaining > 0 && client.connected() && millis() - t1 < UPLOAD_TIMEOUT_MS) {
     size_t toSend = (remaining > 2048) ? 2048 : remaining;
     size_t written = client.write(cloudPhoto.buf + offset, toSend);
     if (written > 0) {
@@ -502,6 +503,13 @@ void cloudUpload() {
     } else {
       delay(5);
     }
+  }
+
+  if (remaining > 0) {
+    client.stop();
+    lastUploadCode = -1;
+    Serial.println("[UPLOAD] Pengiriman foto terputus atau melewati batas waktu");
+    return;
   }
 
   // 3. Baca Status & Response dengan cepat
@@ -655,49 +663,38 @@ void publishTelemetry() {
   esp_mqtt_client_publish(mqttClient, "incubator/" DEVICE_KEY "/motor", isMotorRunning ? "RUNNING" : "STANDBY", 0, 0, 0);
 }
 
+void telemetryTask(void *) {
+  uint32_t lastTelemetry = 0;
+  for (;;) {
+    uint32_t now = millis();
+    if (WiFi.status() == WL_CONNECTED) {
+      if (!mqttClient) initMqtt();
+      if (mqttConnected && (telemetryRequested || now - lastTelemetry >= 2000)) {
+        telemetryRequested = false;
+        lastTelemetry = now;
+        publishTelemetry();
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+}
+
 void cloudTask(void *) {
   delay(1000);
-  uint32_t lastTelemetry = millis();
   uint32_t lastUp = millis();
 
   for (;;) {
     uint32_t now = millis();
     bool localBusy = (int32_t)(localWebBusyUntil - now) > 0;
-
-    if (!localBusy && WiFi.status() == WL_CONNECTED) {
-      if (!mqttClient) {
-        initMqtt();
-      }
-
-      // Tunda foto jika dinamo pembalik telur sedang berputar (anti-blur & anti-drop tegangan)
-      if (isMotorRunning) {
-        if (telemetryRequested || (now - lastTelemetry >= 2000)) {
-          telemetryRequested = false;
-          lastTelemetry = now;
-          publishTelemetry();
-        }
-        vTaskDelay(pdMS_TO_TICKS(200));
-        continue;
-      }
-
-      // 1. Manual Capture seketika jika diminta via MQTT / Web
+    if (!localBusy && WiFi.status() == WL_CONNECTED && !isMotorRunning) {
       if (manualCaptureRequest) {
         manualCaptureRequest = false;
         Serial.println("[UPLOAD] Menjalankan manual capture...");
         cloudUpload();
-        lastUp = now;
-      }
-      // 2. Upload periodik otomatis (15s - 120s)
-      else if (now - lastUp >= uploadIntervalMs) {
-        lastUp = now;
+        lastUp = millis();
+      } else if (now - lastUp >= uploadIntervalMs) {
         cloudUpload();
-      }
-
-      // 3. Telemetri full MQTT: seketika saat ada perubahan sensor/aktuator ATAU periodik tiap 2 detik
-      if (telemetryRequested || (now - lastTelemetry >= 2000)) {
-        telemetryRequested = false;
-        lastTelemetry = now;
-        publishTelemetry();
+        lastUp = millis();
       }
     }
     vTaskDelay(pdMS_TO_TICKS(100));
@@ -1024,6 +1021,7 @@ void setup() {
 
   lastMotorTurn = millis();
   Serial.printf("[INIT] Free Heap: %u, Free PSRAM: %u\n", ESP.getFreeHeap(), ESP.getFreePsram());
+  xTaskCreatePinnedToCore(telemetryTask, "telemetry", 6144, NULL, 1, NULL, 0);
   xTaskCreatePinnedToCore(cloudTask, "cloud", 16384, NULL, 1, NULL, 0);
 }
 

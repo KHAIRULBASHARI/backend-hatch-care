@@ -820,6 +820,7 @@
                 </div>
                 <div>
                     <span id="inc-device-badge" class="badge-status badge-off">ESP Inkubator: Offline</span>
+                    <div id="telemetry-freshness" class="telemetry-sub" style="margin-top: 6px;">Belum ada pembacaan sensor MQTT</div>
                 </div>
             </div>
 
@@ -979,7 +980,7 @@
     </div>
 
     <script src="https://unpkg.com/mqtt@5.16.1/dist/mqtt.min.js"></script>
-    <script src="{{ asset('js/incubator-telemetry.js') }}?v=20261115-mqtt"></script>
+    <script src="{{ asset('js/incubator-telemetry.js') }}?v={{ filemtime(public_path('js/incubator-telemetry.js')) }}"></script>
     <script>
         const csrfToken = document.querySelector('meta[name="csrf-token"]').getAttribute('content');
 
@@ -1158,7 +1159,13 @@
             }
         });
 
-        const incubatorMonitor = IncubatorTelemetry.create({ document });
+        let telemetryStorage = null;
+        try { telemetryStorage = window.localStorage; } catch {}
+        const incubatorMonitor = IncubatorTelemetry.create({
+            document,
+            storage: telemetryStorage,
+            storageKey: 'incubator:last-mqtt:v2:' + @json(config('mqtt.incubator_telemetry_topic')),
+        });
         setInterval(() => incubatorMonitor.tick(), 1000);
 
         async function pollIncubatorTelemetry() {

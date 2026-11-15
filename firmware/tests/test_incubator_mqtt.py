@@ -64,6 +64,25 @@ class IncubatorMqttTests(unittest.TestCase):
                 self.assertIn('digitalWrite(33, HIGH)', setup)
                 self.assertIn('digitalWrite(PIN_RELAY_HEATER, RELAY_OFF)', setup)
 
+    def test_telemetry_runs_separately_from_http_upload_and_local_web_pause(self):
+        for sketch in SKETCHES:
+            with self.subTest(sketch=sketch.name):
+                source = sketch.read_text(encoding='utf-8')
+                task = function_body(source, 'telemetryTask')
+                self.assertIn('publishTelemetry()', task)
+                self.assertNotIn('cloudUpload()', task)
+                self.assertNotIn('localWebBusyUntil', task)
+                self.assertNotIn('publishTelemetry()', function_body(source, 'cloudTask'))
+                self.assertIn('xTaskCreatePinnedToCore(telemetryTask,', function_body(source, 'setup'))
+
+    def test_photo_writes_have_a_bounded_overall_deadline(self):
+        for sketch in SKETCHES:
+            with self.subTest(sketch=sketch.name):
+                source = sketch.read_text(encoding='utf-8')
+                upload = function_body(source, 'cloudUpload')
+                self.assertIn('UPLOAD_TIMEOUT_MS', upload)
+                self.assertIn('client.connect("iot.walker880.my.id", 80, 4000)', upload)
+
     def test_duplicate_sketches_remain_identical(self):
         self.assertEqual(SKETCHES[0].read_bytes(), SKETCHES[1].read_bytes())
 
