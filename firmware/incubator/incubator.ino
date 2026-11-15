@@ -20,8 +20,6 @@
 #include "esp_camera.h"
 #include "esp_wifi.h"
 #include <WiFi.h>
-#include <HTTPClient.h>
-#include <WiFiClientSecure.h>
 #include <Preferences.h>
 #include <WebServer.h>
 #include <Wire.h>
@@ -54,7 +52,9 @@
 #endif
 
 #define MQTT_TOPIC_CONTROL    "incubator/" DEVICE_KEY "/control"
+#define MQTT_TOPIC_SETTINGS   "incubator/" DEVICE_KEY "/settings"
 #define MQTT_TOPIC_TELEMETRY  "incubator/" DEVICE_KEY "/telemetry"
+#define MQTT_TOPIC_STATUS     "incubator/status"
 #ifndef CAMERA_FRAME_SIZE
   #define CAMERA_FRAME_SIZE FRAMESIZE_UXGA  // 1600x1200 (UXGA)
 #endif
@@ -91,7 +91,6 @@
 // Batas waktu & keamanan
 const uint32_t RELAY_MIN_SWITCH_MS   = 3000;   // relay minimal 3 s di satu status (anti-kedip cepat)
 const float    TEMP_HARD_LIMIT       = 40.5f;  // di atas ini lampu dipaksa mati, mode apa pun
-const uint32_t CONTROL_POLL_MS       = 3000;
 const uint32_t UPLOAD_MIN_S          = 15;     // mengikuti interval minimal di web (15 detik)
 const uint32_t UPLOAD_MAX_S          = 3600;
 const uint8_t  DHT_MAX_FAILS         = 3;      // NaN berulang dari DHT baru trigger error
@@ -161,8 +160,6 @@ PhotoBuffer cloudPhoto;
 DHT dht(PIN_DHT, DHT22);
 LiquidCrystal_I2C *lcd = nullptr;
 FastWebServer server(80);
-
-static inline bool useTls() { return strncmp(SERVER_URL, "https", 5) == 0; }
 
 // ─── RELAY LAMPU PEMANAS ──────────────────────────────────────────────────────────
 void applyHeaterPin() {
@@ -367,13 +364,13 @@ static bool jsonNumber(const String &json, const char *key, float &out) {
   return true;
 }
 
-void applyCloudCommands(const String &json) {
-  // Manual capture via MQTT / Web (deduplikasi ID agar tidak looping)
+void applyCloudCommands(const String &json, bool allowTriggers) {
+  // Hanya perintah non-retained boleh memicu satu putaran/foto.
   const char *capReq = jsonValue(json, "triggerCapture");
   const char *capAct = jsonValue(json, "action");
   const char *capCmd = jsonValue(json, "captureCommandId");
-  if ((capReq && !strncmp(capReq, "true", 4)) || (capAct && !strncmp(capAct, "\"capture\"", 9))) {
-    bool isNew = true;
+  if (allowTriggers && ((capReq && !strncmp(capReq, "true", 4)) || (capAct && !strncmp(capAct, "\"capture\"", 9)))) {
+    bool isNew = false;
     if (capCmd && *capCmd == '"') {
       char id[sizeof(lastCaptureCommandId)] = "";
       const char *end = strchr(capCmd + 1, '"');
@@ -384,7 +381,13 @@ void applyCloudCommands(const String &json) {
         if (strcmp(id, lastCaptureCommandId) == 0) {
           isNew = false;
         } else {
+          isNew = true;
           strcpy(lastCaptureCommandId, id);
+          Preferences prefs;
+          if (prefs.begin("incubator", false)) {
+            prefs.putString("lastCaptureCmd", lastCaptureCommandId);
+            prefs.end();
+          }
         }
       }
     }
@@ -396,8 +399,8 @@ void applyCloudCommands(const String &json) {
 
   const char *mot = jsonValue(json, "motorManualRequest");
   const char *cmd = jsonValue(json, "motorCommandId");
-  if (mot && !strncmp(mot, "true", 4)) {
-    bool isNew = true;
+  if (allowTriggers && mot && !strncmp(mot, "true", 4)) {
+    bool isNew = false;
     if (cmd && *cmd == '"') {
       char id[sizeof(lastMotorCommandId)] = "";
       const char *end = strchr(cmd + 1, '"');
@@ -408,6 +411,7 @@ void applyCloudCommands(const String &json) {
         if (strcmp(id, lastMotorCommandId) == 0) {
           isNew = false;
         } else {
+          isNew = true;
           strcpy(lastMotorCommandId, id);
           Preferences prefs;
           if (prefs.begin("incubator", false)) {
@@ -477,21 +481,13 @@ void cloudUpload() {
     return;
   }
 
-  // 1. Header HTTP non-blocking dengan Connection: close
-  float t = currentTemp, h = currentHum;
+  // HTTP membawa JPEG saja; telemetri dan perintah memakai MQTT.
   client.print("POST /api/incubator/upload HTTP/1.1\r\n");
   client.print("Host: iot.walker880.my.id\r\n");
   client.print("User-Agent: ESP32HTTPClient\r\n");
   client.print("X-Device-Key: " DEVICE_KEY "\r\n");
   client.print("Content-Type: image/jpeg\r\n");
   client.printf("Content-Length: %u\r\n", cloudPhoto.len);
-  client.printf("X-RSSI: %d\r\n", WiFi.RSSI());
-  if (isfinite(t) && t > 0) client.printf("X-Temp: %.1f\r\n", t);
-  else                      client.print("X-Temp-Valid: 0\r\n");
-  if (isfinite(h))          client.printf("X-Humidity: %.1f\r\n", h);
-  else                      client.print("X-Humidity-Valid: 0\r\n");
-  client.printf("X-Lamp: %d\r\n", heaterState ? 1 : 0);
-  client.printf("X-Motor: %d\r\n", isMotorRunning ? 1 : 0);
   client.print("Connection: close\r\n\r\n");
 
   // 2. Kirim Buffer Foto dalam chunk 2048 byte tanpa macet di buffer lwIP
@@ -526,18 +522,9 @@ void cloudUpload() {
     if (line == "\r" || line.length() == 0) break;
   }
 
-  // Baca Response Body untuk perintah balik jika ada
-  String body = "";
-  while (client.available()) {
-    body += (char)client.read();
-  }
   client.stop();
 
   uint32_t sendMs = millis() - t1;
-
-  if (code == 200 || code == 201) {
-    applyCloudCommands(body);
-  }
 
   lastUploadCode  = code;
   lastUploadTime  = millis();
@@ -557,9 +544,8 @@ static void mqttEventHandler(void *handler_args, esp_event_base_t base, int32_t 
       mqttConnected = true;
       Serial.println("[MQTT] Terhubung ke Cloudflare WSS (Port 443)!");
       esp_mqtt_client_subscribe(mqttClient, MQTT_TOPIC_CONTROL, 1);
-      esp_mqtt_client_subscribe(mqttClient, "incubator/control", 1);
-      esp_mqtt_client_subscribe(mqttClient, "incubator/" DEVICE_KEY "/set", 1);
-      esp_mqtt_client_publish(mqttClient, "incubator/" DEVICE_KEY "/status", "{\"online\":true}", 0, 1, 1);
+      esp_mqtt_client_subscribe(mqttClient, MQTT_TOPIC_SETTINGS, 1);
+      esp_mqtt_client_publish(mqttClient, MQTT_TOPIC_STATUS, "{\"online\":true}", 0, 1, 1);
       telemetryRequested = true;
       break;
 
@@ -569,14 +555,17 @@ static void mqttEventHandler(void *handler_args, esp_event_base_t base, int32_t 
       break;
 
     case MQTT_EVENT_DATA: {
-      if (event->data && event->data_len > 0) {
-        char payload[512] = {0};
-        int dlen = min((int)sizeof(payload) - 1, event->data_len);
-        memcpy(payload, event->data, dlen);
-        payload[dlen] = '\0';
-        Serial.printf("[MQTT RECV] %s\n", payload);
-        applyCloudCommands(String(payload));
-      }
+      bool settings = event->topic && event->topic_len == strlen(MQTT_TOPIC_SETTINGS) &&
+                      memcmp(event->topic, MQTT_TOPIC_SETTINGS, event->topic_len) == 0;
+      bool control = event->topic && event->topic_len == strlen(MQTT_TOPIC_CONTROL) &&
+                     memcmp(event->topic, MQTT_TOPIC_CONTROL, event->topic_len) == 0;
+      if ((!settings && !control) || (control && event->retain)) break;
+      if (event->current_data_offset != 0 || event->data_len != event->total_data_len ||
+          !event->data || event->data_len <= 0 || event->data_len >= 512) break;
+      char payload[512] = {0};
+      memcpy(payload, event->data, event->data_len);
+      Serial.println(settings ? "[MQTT] Pengaturan diterima" : "[MQTT] Perintah diterima");
+      applyCloudCommands(String(payload), control);
       break;
     }
 
@@ -593,12 +582,9 @@ void initMqtt() {
   if (mqttClient) return;
   Serial.printf("[MQTT] Inisialisasi... Free Heap: %u\n", ESP.getFreeHeap());
   esp_mqtt_client_config_t mqtt_cfg = {};
-  mqtt_cfg.broker.address.hostname = "mqtt.walker880.my.id";
-  mqtt_cfg.broker.address.port = 443;
-  mqtt_cfg.broker.address.transport = MQTT_TRANSPORT_OVER_WSS;
-  mqtt_cfg.broker.address.path = "/mqtt";
+  mqtt_cfg.broker.address.uri = MQTT_BROKER_URI;
   mqtt_cfg.broker.verification.crt_bundle_attach = esp_crt_bundle_attach;
-  mqtt_cfg.session.last_will.topic = "incubator/" DEVICE_KEY "/status";
+  mqtt_cfg.session.last_will.topic = MQTT_TOPIC_STATUS;
   mqtt_cfg.session.last_will.msg = "{\"online\":false}";
   mqtt_cfg.session.last_will.msg_len = 16;
   mqtt_cfg.session.last_will.qos = 1;
@@ -628,9 +614,9 @@ void publishTelemetry() {
   if (!mqttConnected || !mqttClient) return;
   float t = currentTemp, h = currentHum;
   int32_t turnSec = secondsUntilTurn();
-  char json[384];
-  snprintf(json, sizeof(json),
-    "{\"temp\":%s,\"temperature\":%s,\"hum\":%s,\"humidity\":%s,\"heater\":%s,\"lamp\":%s,\"lampMode\":\"%s\",\"motor\":%s,\"tempMin\":%.1f,\"tempMax\":%.1f,\"turnCountdownSec\":%ld,\"rssi\":%d,\"uptime\":%lu}",
+  char json[512];
+  int length = snprintf(json, sizeof(json),
+    "{\"temp\":%s,\"temperature\":%s,\"hum\":%s,\"humidity\":%s,\"heater\":%s,\"lamp\":%s,\"lampMode\":\"%s\",\"motor\":%s,\"tempMin\":%.1f,\"tempMax\":%.1f,\"motorIntervalHours\":%.2f,\"motorDurationSeconds\":%lu,\"captureIntervalSeconds\":%lu,\"turnCountdownSec\":%ld,\"rssi\":%d,\"uptime\":%lu}",
     isfinite(t) ? String(t, 1).c_str() : "null",
     isfinite(t) ? String(t, 1).c_str() : "null",
     isfinite(h) ? String((int)h).c_str() : "null",
@@ -641,10 +627,14 @@ void publishTelemetry() {
     isMotorRunning ? "true" : "false",
     (float)tempSetpointMin,
     (float)tempSetpointMax,
+    (float)motorIntervalMs / 3600000.0f,
+    (unsigned long)(motorDurationMs / 1000UL),
+    (unsigned long)(uploadIntervalMs / 1000UL),
     (long)turnSec,
     WiFi.RSSI(),
     (unsigned long)(millis() / 1000UL)
   );
+  if (length < 0 || length >= (int)sizeof(json)) return;
   esp_mqtt_client_publish(mqttClient, MQTT_TOPIC_TELEMETRY, json, 0, 0, 0);
   esp_mqtt_client_publish(mqttClient, "incubator/telemetry", json, 0, 0, 0);
 
@@ -665,32 +655,8 @@ void publishTelemetry() {
   esp_mqtt_client_publish(mqttClient, "incubator/" DEVICE_KEY "/motor", isMotorRunning ? "RUNNING" : "STANDBY", 0, 0, 0);
 }
 
-void cloudPoll() {
-  if (mqttConnected) return; // Prioritas MQTT: jangan polling HTTP jika MQTT terhubung
-  WiFiClientSecure sclient;
-  WiFiClient       pclient;
-  HTTPClient       http;
-  String url = String(SERVER_URL) + "/api/incubator/device-control";
-  if (lastMotorCommandId[0]) url += String("?motorAck=") + lastMotorCommandId;
-
-  if (useTls()) {
-    sclient.setInsecure();
-    sclient.setTimeout(5);
-    http.begin(sclient, url);
-  } else {
-    http.begin(pclient, url);
-  }
-
-  http.setTimeout(4000);
-  http.setUserAgent("ESP32HTTPClient");
-  http.addHeader("X-Device-Key", DEVICE_KEY);
-  if (http.GET() == 200) applyCloudCommands(http.getString());
-  http.end();
-}
-
 void cloudTask(void *) {
   delay(1000);
-  uint32_t lastPoll = millis();
   uint32_t lastTelemetry = millis();
   uint32_t lastUp = millis();
 
@@ -732,12 +698,6 @@ void cloudTask(void *) {
         telemetryRequested = false;
         lastTelemetry = now;
         publishTelemetry();
-      }
-
-      // 4. Fallback HTTP polling HANYA jika MQTT terputus
-      if (!mqttConnected && (now - lastPoll >= 10000)) {
-        lastPoll = now;
-        cloudPoll();
       }
     }
     vTaskDelay(pdMS_TO_TICKS(100));
@@ -974,6 +934,7 @@ void setup() {
   Preferences prefs;
   if (prefs.begin("incubator", true)) {
     prefs.getString("lastMotorCmd", lastMotorCommandId, sizeof(lastMotorCommandId));
+    prefs.getString("lastCaptureCmd", lastCaptureCommandId, sizeof(lastCaptureCommandId));
     storedUploadSeconds = constrain(prefs.getUInt("photoSeconds", 120), UPLOAD_MIN_S, UPLOAD_MAX_S);
     uploadIntervalMs = storedUploadSeconds * 1000UL;
     prefs.end();

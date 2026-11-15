@@ -2,12 +2,15 @@
 
 namespace App\Http\Controllers;
 
+use App\Services\IncubatorMqtt;
+use Illuminate\Http\Exceptions\HttpResponseException;
 use Illuminate\Http\Request;
 use Illuminate\Http\UploadedFile;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
+use Illuminate\Validation\ValidationException;
 
 class IncubatorController extends Controller
 {
@@ -244,7 +247,7 @@ class IncubatorController extends Controller
     {
         if ($request->isMethod('post') || $request->isMethod('put')) {
             $request->validate([
-                'captureIntervalSeconds' => 'sometimes|required|integer|between:5,3600',
+                'captureIntervalSeconds' => 'sometimes|required|integer|between:15,3600',
                 'lampMode' => 'sometimes|required|string|in:auto,on,off',
                 'tempMin' => 'sometimes|required|numeric|between:30,45',
                 'tempMax' => 'sometimes|required|numeric|between:30,45',
@@ -259,7 +262,7 @@ class IncubatorController extends Controller
 
             $mqttPayload = [];
 
-            $current = Cache::lock('incubator:control-lock', 10)->block(3, function () use ($request, &$mqttPayload) {
+            $current = Cache::lock('incubator:control-lock', 15)->block(3, function () use ($request, &$mqttPayload) {
                 $current = $this->controlSettings();
                 if ($request->has('lampMode')) {
                     $mode = strtolower((string) $request->input('lampMode'));
@@ -304,19 +307,33 @@ class IncubatorController extends Controller
                     $mqttPayload['captureIntervalSeconds'] = $current['captureIntervalSeconds'];
                 }
 
+                if ($current['tempMin'] >= $current['tempMax']) {
+                    throw ValidationException::withMessages([
+                        'tempMax' => 'Suhu maksimum harus lebih besar dari suhu minimum.',
+                    ]);
+                }
+
+                if (! empty($mqttPayload)) {
+                    try {
+                        app(IncubatorMqtt::class)->publish($mqttPayload, $current);
+                    } catch (\Throwable $exception) {
+                        throw new HttpResponseException(response()->json([
+                            'status' => 'error',
+                            'transport' => 'mqtt',
+                            'message' => 'Broker MQTT tidak tersedia. Perintah belum dikirim.',
+                        ], 503));
+                    }
+                }
+
                 Cache::forever('incubator:control', $current);
 
                 return $current;
             });
 
-            // Kirim notifikasi realtime via MQTT jika ada payload kontrol
-            if (!empty($mqttPayload)) {
-                $this->publishMqttControl($mqttPayload);
-            }
-
             return response()->json([
                 'status' => 'success',
-                'message' => 'Control settings updated',
+                'message' => 'Perintah diterima broker MQTT; menunggu telemetri perangkat.',
+                'transport' => 'mqtt',
                 'control' => $current,
             ]);
         }
@@ -325,25 +342,6 @@ class IncubatorController extends Controller
             'status' => 'success',
             'control' => $this->controlSettings(),
         ]);
-    }
-
-    /**
-     * Publish perintah kontrol ke broker MQTT lokal (port 1883)
-     */
-    private function publishMqttControl(array $payload): void
-    {
-        try {
-            $deviceKey = config('services.device.key') ?? env('DEVICE_KEY', 'EggCamSecretKey_9876543210_abcdef1234567890');
-            $topic = 'incubator/' . $deviceKey . '/control';
-            $json = json_encode($payload, JSON_UNESCAPED_SLASHES);
-            if (function_exists('exec')) {
-                $escapedJson = escapeshellarg($json);
-                $escapedTopic = escapeshellarg($topic);
-                @exec("mosquitto_pub -h 127.0.0.1 -p 1883 -t {$escapedTopic} -m {$escapedJson} > /dev/null 2>&1 &");
-            }
-        } catch (\Throwable $e) {
-            // Silently fall back to cache polling
-        }
     }
 
     public function deviceControl(Request $request)

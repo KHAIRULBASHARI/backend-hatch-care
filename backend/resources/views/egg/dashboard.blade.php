@@ -9,7 +9,6 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
-    <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
 
     <style>
         :root {
@@ -136,6 +135,25 @@
             grid-template-columns: 1fr;
             gap: 24px;
         }
+
+        .btn-capture-trigger {
+            width: 100%;
+            min-height: 48px;
+            background: #059669;
+            color: #ffffff;
+            border: 1px solid #34d399;
+            border-radius: 8px;
+            font-size: 14px;
+            font-weight: 700;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            margin-bottom: 12px;
+        }
+        .btn-capture-trigger:hover:not(:disabled) { background: #047857; }
+        .btn-capture-trigger:disabled { opacity: 0.6; cursor: not-allowed; }
 
         @media (min-width: 900px) {
             .main-grid {
@@ -902,13 +920,17 @@
                 <!-- 3. Kamera & Jeda Foto + Lampu Otomatis Inkubator -->
                 <div class="control-box">
                     <div class="control-box-title">
-                        <span>📷 Interval Foto & Nyala Lampu/LED</span>
+                        <span>📷 Kontrol Foto Kamera Inkubator</span>
                     </div>
-                    <p class="control-box-desc">Atur jeda waktu ESP32-CAM menyalakan lampu warm/LED dan memotret rak telur otomatis ke web (disimpan 1 jam terakhir).</p>
+                    <p class="control-box-desc">Perintah foto melalui MQTT; unggahan JPEG dan galeri tetap melalui HTTP.</p>
+                    <button type="button" id="btn-trigger-capture" class="btn-capture-trigger" onclick="triggerCaptureManual()">
+                        <span id="capture-btn-text">Ambil Foto Manual Sekarang</span>
+                    </button>
+                    <div id="msg-capture-trigger" class="feedback-msg" role="status"></div>
 
                     <form id="interval-form" style="display: grid; gap: 12px; margin-top: auto;">
                         <div class="field-group">
-                            <label for="capture-interval">Interval Foto & Lampu (Detik)</label>
+                            <label for="capture-interval">Interval Foto Otomatis (Detik)</label>
                             <input id="capture-interval" type="number" min="15" max="3600" step="1" value="120" required>
                             <span class="control-box-desc">Nilai antara 15 sampai 3600 detik (default: 120 detik / 2 menit).</span>
                         </div>
@@ -956,8 +978,9 @@
         </section>
     </div>
 
+    <script src="https://unpkg.com/mqtt@5.16.1/dist/mqtt.min.js"></script>
+    <script src="{{ asset('js/incubator-telemetry.js') }}?v=20261115-mqtt"></script>
     <script>
-        // ─── Kontrol & Telemetri Inkubator (Suhu & Dinamo Goyang) ────────────────────
         const csrfToken = document.querySelector('meta[name="csrf-token"]').getAttribute('content');
 
         const inputTempMin = document.getElementById('input-temp-min');
@@ -988,9 +1011,8 @@
         }
 
         async function setLampMode(mode) {
-            updateModeButtons(mode);
             msgTemp.style.color = 'var(--text-secondary)';
-            msgTemp.textContent = `Mengubah mode lampu ke ${mode.toUpperCase()}...`;
+            msgTemp.textContent = `Mengirim mode lampu ${mode.toUpperCase()} melalui MQTT...`;
             try {
                 const res = await fetch('/incubator/control', {
                     method: 'POST',
@@ -998,9 +1020,8 @@
                     body: JSON.stringify({ lampMode: mode })
                 });
                 if (!res.ok) throw new Error();
-                document.getElementById('tele-lamp-mode').textContent = mode === 'auto' ? 'Auto (Termostat)' : (mode === 'on' ? 'Manual ON' : 'Manual OFF');
                 msgTemp.style.color = 'var(--success)';
-                msgTemp.textContent = `Mode lampu berhasil diubah ke: ${mode.toUpperCase()}`;
+                msgTemp.textContent = 'Broker MQTT menerima mode lampu. Menunggu konfirmasi perangkat.';
             } catch (e) {
                 msgTemp.style.color = 'var(--danger)';
                 msgTemp.textContent = 'Gagal mengubah mode lampu. Periksa koneksi.';
@@ -1026,9 +1047,8 @@
                     body: JSON.stringify({ tempMin: min, tempMax: max })
                 });
                 if (!res.ok) throw new Error();
-                document.getElementById('tele-setpoint-range').textContent = `${min.toFixed(1)} - ${max.toFixed(1)}`;
                 msgTemp.style.color = 'var(--success)';
-                msgTemp.textContent = 'Setpoint suhu berhasil disimpan! ESP32 akan menerapkannya.';
+                msgTemp.textContent = 'Setpoint dikirim melalui MQTT. Menunggu konfirmasi perangkat.';
             } catch (err) {
                 msgTemp.style.color = 'var(--danger)';
                 msgTemp.textContent = 'Gagal menyimpan setpoint suhu.';
@@ -1052,7 +1072,7 @@
                 });
                 if (!res.ok) throw new Error();
                 msgMotorTrigger.style.color = 'var(--success)';
-                msgMotorTrigger.textContent = '✅ Perintah berhasil dikirim! ESP32 akan langsung memutar dinamo pembalik telur.';
+                msgMotorTrigger.textContent = 'Broker MQTT menerima perintah. Menunggu status putaran perangkat.';
                 motorBtnText.textContent = 'Perintah Terkirim (Menunggu Putaran)';
                 setTimeout(() => {
                     btnTriggerMotor.disabled = false;
@@ -1063,6 +1083,31 @@
                 msgMotorTrigger.textContent = 'Gagal mengirim perintah putar dinamo.';
                 btnTriggerMotor.disabled = false;
                 motorBtnText.textContent = 'Putar / Goyang Dinamo Sekarang';
+            }
+        }
+
+        async function triggerCaptureManual() {
+            const button = document.getElementById('btn-trigger-capture');
+            const message = document.getElementById('msg-capture-trigger');
+            button.disabled = true;
+            message.textContent = 'Mengirim perintah foto melalui MQTT...';
+            message.style.color = 'var(--text-secondary)';
+            try {
+                const response = await fetch('/incubator/control', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'X-CSRF-TOKEN': csrfToken },
+                    body: JSON.stringify({ triggerCapture: true }),
+                });
+                const result = await response.json();
+                if (!response.ok) throw new Error(result.message || 'Gagal mengirim perintah foto.');
+                message.textContent = 'Broker MQTT menerima perintah. Menunggu foto diunggah perangkat.';
+                message.style.color = 'var(--success)';
+                [3000, 6000, 10000].forEach(delay => setTimeout(pollIncubatorTelemetry, delay));
+            } catch (error) {
+                message.textContent = error.message;
+                message.style.color = 'var(--danger)';
+            } finally {
+                setTimeout(() => { button.disabled = false; }, 4000);
             }
         }
 
@@ -1080,9 +1125,8 @@
                     body: JSON.stringify({ motorIntervalHours: hours, motorDurationSeconds: duration })
                 });
                 if (!res.ok) throw new Error();
-                document.getElementById('tele-motor-info').textContent = `Tiap ${hours} jam (${duration}s)`;
                 msgMotorSchedule.style.color = 'var(--success)';
-                msgMotorSchedule.textContent = 'Jadwal putaran dinamo berhasil disimpan!';
+                msgMotorSchedule.textContent = 'Jadwal dikirim melalui MQTT. Menunggu konfirmasi perangkat.';
             } catch (e) {
                 msgMotorSchedule.style.color = 'var(--danger)';
                 msgMotorSchedule.textContent = 'Gagal menyimpan jadwal dinamo.';
@@ -1114,55 +1158,8 @@
             }
         });
 
-        function applyLiveTelemetry(data) {
-            if (!data) return;
-            const teleTemp = document.getElementById('tele-temp');
-            const teleHum = document.getElementById('tele-hum');
-            const t = data.temperature !== undefined && data.temperature !== null ? data.temperature : data.temp;
-            const h = data.humidity !== undefined && data.humidity !== null ? data.humidity : data.hum;
-            if (teleTemp && t !== null && t !== undefined) {
-                teleTemp.textContent = parseFloat(t).toFixed(1);
-            }
-            if (teleHum && h !== null && h !== undefined) {
-                teleHum.textContent = Math.round(h);
-            }
-
-            if (data.heater !== undefined || data.lamp !== undefined) {
-                const isHeater = !!(data.heater ?? data.lamp);
-                const teleLamp = document.getElementById('tele-lamp-status');
-                if (teleLamp) {
-                    teleLamp.className = isHeater ? 'badge-status badge-on' : 'badge-status badge-off';
-                    teleLamp.textContent = isHeater ? 'MENYALA (ON)' : 'MATI (OFF)';
-                }
-            }
-
-            if (data.motor !== undefined) {
-                const isMotor = !!data.motor;
-                const teleMotor = document.getElementById('tele-motor-status');
-                if (teleMotor) {
-                    teleMotor.className = isMotor ? 'badge-status badge-warn' : 'badge-status badge-off';
-                    teleMotor.textContent = isMotor ? 'SEDANG BERPUTAR' : 'STANDBY';
-                }
-            }
-
-            const incBadge = document.getElementById('inc-device-badge');
-            if (incBadge) {
-                incBadge.className = 'badge-status badge-on';
-                incBadge.textContent = 'ESP Inkubator: Online (MQTT ⚡)';
-            }
-
-            if (data.tempMin !== undefined && data.tempMax !== undefined) {
-                const range = document.getElementById('tele-setpoint-range');
-                if (range) range.textContent = `${parseFloat(data.tempMin).toFixed(1)} - ${parseFloat(data.tempMax).toFixed(1)}`;
-                if (typeof inputTempMin !== 'undefined' && document.activeElement !== inputTempMin) inputTempMin.value = data.tempMin;
-                if (typeof inputTempMax !== 'undefined' && document.activeElement !== inputTempMax) inputTempMax.value = data.tempMax;
-            }
-            if (data.lampMode) {
-                updateModeButtons(data.lampMode);
-                const modeEl = document.getElementById('tele-lamp-mode');
-                if (modeEl) modeEl.textContent = data.lampMode === 'auto' ? 'Auto (Termostat)' : (data.lampMode === 'on' ? 'Manual ON' : 'Manual OFF');
-            }
-        }
+        const incubatorMonitor = IncubatorTelemetry.create({ document });
+        setInterval(() => incubatorMonitor.tick(), 1000);
 
         async function pollIncubatorTelemetry() {
             try {
@@ -1170,67 +1167,7 @@
                 if (!res.ok) return;
                 const data = await res.json();
 
-                // Telemetri Suhu & Kelembaban
-                const teleTemp = document.getElementById('tele-temp');
-                const teleHum = document.getElementById('tele-hum');
-                if (data.temperature !== null && data.temperature !== undefined) {
-                    teleTemp.textContent = parseFloat(data.temperature).toFixed(1);
-                }
-                if (data.humidity !== null && data.humidity !== undefined) {
-                    teleHum.textContent = Math.round(data.humidity);
-                }
-
-                // Telemetri Lampu
-                const teleLamp = document.getElementById('tele-lamp-status');
-                if (data.lamp) {
-                    teleLamp.className = 'badge-status badge-on';
-                    teleLamp.textContent = 'MENYALA (ON)';
-                } else {
-                    teleLamp.className = 'badge-status badge-off';
-                    teleLamp.textContent = 'MATI (OFF)';
-                }
-
-                // Telemetri Dinamo
-                const teleMotor = document.getElementById('tele-motor-status');
-                if (data.motor) {
-                    teleMotor.className = 'badge-status badge-warn';
-                    teleMotor.textContent = 'SEDANG BERPUTAR';
-                } else {
-                    teleMotor.className = 'badge-status badge-off';
-                    teleMotor.textContent = 'STANDBY';
-                }
-
-                // Status Koneksi ESP Inkubator
-                const incBadge = document.getElementById('inc-device-badge');
-                if (data.online) {
-                    incBadge.className = 'badge-status badge-on';
-                    incBadge.textContent = 'ESP Inkubator: Online';
-                } else {
-                    incBadge.className = 'badge-status badge-off';
-                    incBadge.textContent = data.last_seen_sec !== null ? `ESP Offline (${data.last_seen_sec}s lalu)` : 'ESP Inkubator: Offline';
-                }
-
-                // Update Control Values jika ada & user tidak sedang mengetik
-                if (data.control) {
-                    const c = data.control;
-                    if (c.lampMode) {
-                        updateModeButtons(c.lampMode);
-                        document.getElementById('tele-lamp-mode').textContent = c.lampMode === 'auto' ? 'Auto (Termostat)' : (c.lampMode === 'on' ? 'Manual ON' : 'Manual OFF');
-                    }
-                    if (c.tempMin !== undefined && c.tempMax !== undefined) {
-                        document.getElementById('tele-setpoint-range').textContent = `${parseFloat(c.tempMin).toFixed(1)} - ${parseFloat(c.tempMax).toFixed(1)}`;
-                        if (document.activeElement !== inputTempMin) inputTempMin.value = c.tempMin;
-                        if (document.activeElement !== inputTempMax) inputTempMax.value = c.tempMax;
-                    }
-                    if (c.motorIntervalHours !== undefined && c.motorDurationSeconds !== undefined) {
-                        document.getElementById('tele-motor-info').textContent = `Tiap ${c.motorIntervalHours} jam (${c.motorDurationSeconds}s)`;
-                        if (document.activeElement !== inputMotorHours) inputMotorHours.value = c.motorIntervalHours;
-                        if (document.activeElement !== inputMotorDuration) inputMotorDuration.value = c.motorDurationSeconds;
-                    }
-                    if (c.captureIntervalSeconds !== undefined && document.activeElement !== intervalInput) {
-                        intervalInput.value = c.captureIntervalSeconds;
-                    }
-                }
+                // HTTP hanya memperbarui galeri foto, bukan nilai sensor atau aktuator.
 
                 // Render Foto Terbaru & Galeri Riwayat 1 Jam Terakhir
                 const history = Array.isArray(data.history) ? data.history : [];
@@ -1308,14 +1245,17 @@
         }
 
         pollIncubatorTelemetry();
-        setInterval(pollIncubatorTelemetry, 3000);
+        setInterval(pollIncubatorTelemetry, 10000);
 
         // MQTT WebSocket Live Real-Time Client (Cloudflare WSS Port 443)
         let dashMqtt = null;
         function initDashboardMqtt() {
-            if (typeof mqtt === 'undefined') return;
+            if (typeof mqtt === 'undefined') {
+                incubatorMonitor.disconnected();
+                return;
+            }
             try {
-                dashMqtt = mqtt.connect('wss://mqtt.walker880.my.id:443/mqtt', {
+                dashMqtt = mqtt.connect(@json(config('mqtt.websocket_url')), {
                     clientId: 'web_' + Math.random().toString(16).slice(2, 10),
                     clean: true,
                     connectTimeout: 5000,
@@ -1324,17 +1264,19 @@
 
                 dashMqtt.on('connect', () => {
                     console.log('[MQTT-WSS] Terhubung ke broker MQTT cloud (Port 443)!');
-                    dashMqtt.subscribe('incubator/+/telemetry');
-                    dashMqtt.subscribe('incubator/telemetry');
-                    dashMqtt.subscribe('incubator/+/temperature');
-                    dashMqtt.subscribe('incubator/+/humidity');
-                    dashMqtt.subscribe('incubator/+/heater');
-                    dashMqtt.subscribe('incubator/+/motor');
-                    dashMqtt.subscribe('candling/+/telemetry');
-                    dashMqtt.subscribe('candling/+/status');
+                    dashMqtt.subscribe([
+                        @json(config('mqtt.incubator_telemetry_topic')),
+                        @json(config('mqtt.incubator_status_topic')),
+                        'candling/+/telemetry', 'candling/+/status',
+                    ], { qos: 1 }, error => {
+                        if (error) incubatorMonitor.disconnected();
+                    });
                 });
 
-                dashMqtt.on('message', (topic, payload) => {
+                dashMqtt.on('close', () => incubatorMonitor.disconnected());
+                dashMqtt.on('offline', () => incubatorMonitor.disconnected());
+                dashMqtt.on('error', () => incubatorMonitor.disconnected());
+                dashMqtt.on('message', (topic, payload, packet) => {
                     const text = payload.toString();
                     if (topic.startsWith('candling/')) {
                         const dot = document.getElementById('status-dot');
@@ -1362,34 +1304,19 @@
                         return;
                     }
 
-                    if (topic.endsWith('/telemetry') || topic === 'incubator/telemetry') {
-                        try {
-                            const data = JSON.parse(text);
-                            applyLiveTelemetry(data);
-                        } catch (e) {}
-                    } else if (topic.endsWith('/temperature') || topic === 'incubator/temperature') {
-                        const el = document.getElementById('tele-temp');
-                        if (el && text.length > 0) el.textContent = parseFloat(text).toFixed(1);
-                    } else if (topic.endsWith('/humidity') || topic === 'incubator/humidity') {
-                        const el = document.getElementById('tele-hum');
-                        if (el && text.length > 0) el.textContent = Math.round(parseFloat(text));
-                    } else if (topic.endsWith('/heater')) {
-                        const el = document.getElementById('tele-lamp-status');
-                        if (el) {
-                            const on = text === 'ON';
-                            el.className = on ? 'badge-status badge-on' : 'badge-status badge-off';
-                            el.textContent = on ? 'MENYALA (ON)' : 'MATI (OFF)';
+                    try {
+                        const data = JSON.parse(text);
+                        if (topic === @json(config('mqtt.incubator_telemetry_topic'))) {
+                            incubatorMonitor.telemetry(data, packet?.retain === true);
+                        } else if (topic === @json(config('mqtt.incubator_status_topic'))) {
+                            incubatorMonitor.status(data);
                         }
-                    } else if (topic.endsWith('/motor')) {
-                        const el = document.getElementById('tele-motor-status');
-                        if (el) {
-                            const run = text === 'RUNNING';
-                            el.className = run ? 'badge-status badge-warn' : 'badge-status badge-off';
-                            el.textContent = run ? 'SEDANG BERPUTAR' : 'STANDBY';
-                        }
+                    } catch (error) {
+                        console.warn('Pesan telemetri MQTT tidak valid.');
                     }
                 });
             } catch (err) {
+                incubatorMonitor.disconnected();
                 console.warn('[MQTT-WSS] Inisialisasi WebSocket MQTT dibatalkan:', err);
             }
         }
