@@ -1,13 +1,3 @@
-"""
-app.py
-======
-RESTful API Candling Telur (Fertil, Infertil, Mortal) berbasis Flask.
-Menggunakan Deep Learning / Neural Network Keras Sequential MLP dan
-Computer Vision Klasik (Binerisasi ROI & Ekstraksi 59 Fitur).
-
-Didesain untuk diintegrasikan dengan Website Laravel, Node.js, atau Frontend SPA.
-"""
-
 import os
 import sys
 import io

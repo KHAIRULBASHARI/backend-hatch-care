@@ -1,5 +1,5 @@
 {
-  "dibuat": "2026-11-03T21:55:16",
+  "dibuat": "2026-11-13T04:40:41",
   "metode": "Neural Network (Keras Sequential MLP)",
   "arsitektur": "Input(59) -> Dense(128, ReLU) -> Dropout(0.25) -> Dense(64, ReLU) -> Dropout(0.15) -> Dense(3, Softmax)",
   "hidden_layer_sizes": [
@@ -15,8 +15,8 @@
   "optimizer": "adam",
   "l2_regularizer": 0.001,
   "learning_rate": 0.001,
-  "total_epoch": 79,
-  "best_epoch": 64,
+  "total_epoch": 100,
+  "best_epoch": 90,
   "kelas": [
     "fertil",
     "infertil",
@@ -88,11 +88,11 @@
   "n_train": 1400,
   "n_val": 300,
   "n_test": 300,
-  "best_val_loss": 0.16317394375801086,
-  "val_akurasi": 0.9633333333333334,
-  "val_macro_f1": 0.9632494979041143,
-  "test_akurasi": 0.9733333333333334,
-  "test_macro_f1": 0.9733906896091771,
-  "test_log_loss": 0.134252667427063,
+  "best_val_loss": 0.17796018719673157,
+  "val_akurasi": 0.97,
+  "val_macro_f1": 0.9699329149895414,
+  "test_akurasi": 0.97,
+  "test_macro_f1": 0.9700955391476965,
+  "test_log_loss": 0.1231432855129242,
   "versi_keras": "3.15.1"
 }

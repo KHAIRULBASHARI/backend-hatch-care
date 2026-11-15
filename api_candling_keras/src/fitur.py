@@ -192,13 +192,18 @@ def ekstrak_peta_darah(rgb, mask=None):
 
     # Fusi peta serapan darah
     fusi = 0.60 * diff_clahe.astype(np.float32) + 0.40 * g_inv.astype(np.float32)
-    peta_darah = cv2.normalize(fusi, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    peta_darah = np.zeros((h, w), dtype=np.uint8)
+    if mask.any():
+        peta_darah[mask] = cv2.normalize(
+            fusi[mask], None, 0, 255, cv2.NORM_MINMAX
+        ).astype(np.uint8)
 
     # Visualisasi RGB berfokus pada jaringan darah
     vis_darah = rgb.copy()
     vis_darah[:, :, 0] = np.clip(rgb[:, :, 0].astype(np.int32) + (peta_darah * 0.40).astype(np.int32), 0, 255).astype(np.uint8)
     vis_darah[:, :, 1] = np.clip(rgb[:, :, 1].astype(np.int32) - (peta_darah * 0.30).astype(np.int32), 0, 255).astype(np.uint8)
     vis_darah[:, :, 2] = np.clip(rgb[:, :, 2].astype(np.int32) - (peta_darah * 0.30).astype(np.int32), 0, 255).astype(np.uint8)
+    vis_darah[~mask] = 0
 
     # Statistik kuantitatif jaringan darah di dalam ROI
     v = peta_darah[mask].astype(np.float32) / 255.0
@@ -349,10 +354,6 @@ def preprocess(img, ukuran=UKURAN):
     # 1. Deteksi objek telur, buang tangan/latar, crop rapat, dan kontraskan secara seragam
     rgb, crop_box, is_closeup = deteksi_crop_telur(img_rgb, target_size=ukuran)
 
-    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-    gray = cv2.createCLAHE(clipLimit=CLAHE_CLIP, tileGridSize=CLAHE_GRID).apply(gray)
-    gray_blur = cv2.GaussianBlur(gray, (BLUR_K, BLUR_K), 0)
-
     # 2. Segmentasi ROI & Binerisasi objek telur (memisahkan objek dari latar belakang)
     mask, roi_ok, roi_mode, hull = _segmentasi_roi(rgb)
 
@@ -364,13 +365,21 @@ def preprocess(img, ukuran=UKURAN):
     # Rekonstruksi Citra RGB (objek telur tetap warna aslinya, latar belakang hitam pekat)
     rgb_masked = cv2.bitwise_and(rgb, rgb, mask=mask.astype(np.uint8))
 
-    # 3. Normalisasi relatif di dalam ROI (p2..p98 -> 0..1)
+    # 3. Tahap grayscale/CLAHE dimulai dari citra RGB hasil rekonstruksi.
+    gray = cv2.cvtColor(rgb_masked, cv2.COLOR_RGB2GRAY)
+    gray = cv2.createCLAHE(clipLimit=CLAHE_CLIP, tileGridSize=CLAHE_GRID).apply(gray)
+    gray[~mask] = 0
+    gray_blur = cv2.GaussianBlur(gray, (BLUR_K, BLUR_K), 0)
+    gray_blur[~mask] = 0
+
+    # 4. Normalisasi relatif di dalam ROI (p2..p98 -> 0..1)
     v = gray_blur[mask].astype(np.float32)
     p2, p98 = np.percentile(v, [2, 98])
     norm = np.clip((gray_blur.astype(np.float32) - p2) / (p98 - p2 + 1e-6), 0, 1).astype(np.float32)
+    norm[~mask] = 0
 
-    # 4. Ekstraksi peta jaringan darah & embrio
-    peta_darah, vis_darah, stats_darah = ekstrak_peta_darah(rgb, mask)
+    # 5. Ekstraksi peta jaringan darah & embrio dari RGB hasil rekonstruksi
+    peta_darah, vis_darah, stats_darah = ekstrak_peta_darah(rgb_masked, mask)
 
     return {
         "rgb": rgb,
@@ -405,7 +414,7 @@ def _blob_gelap(norm, mask):
 def ekstrak_fitur_dict(img):
     """Return (OrderedDict fitur, info). info berisi roi_ok, roi_mode, crop_box."""
     pre = preprocess(img)
-    mask, norm, rgb = pre["mask"], pre["norm"], pre["rgb"]
+    mask, norm, rgb = pre["mask"], pre["norm"], pre["rgb_masked"]
     v = norm[mask]
     f = OrderedDict()
 
@@ -606,9 +615,9 @@ def tahapan(img):
         "1. crop & kontras": pre["rgb"],
         "2. binerisasi ROI": pre["roi_vis"],
         "3. rekonstruksi RGB": pre["rgb_masked"],
-        "4. gray + CLAHE": pre["gray"],
-        "5. peta darah": pre["peta_darah"],
-        "6. vis. jaringan": pre["vis_darah"],
+        "4. gray + CLAHE dari rekonstruksi": pre["gray"],
+        "5. peta darah dari rekonstruksi": pre["peta_darah"],
+        "6. vis. jaringan dari rekonstruksi": pre["vis_darah"],
         "roi_ok": pre["roi_ok"],
         "roi_mode": pre["roi_mode"],
     }
@@ -662,4 +671,3 @@ def muat_model_candling(dir_models=None):
 
     wrapper = KerasCandlingWrapper(model, scaler, classes)
     return wrapper, meta
-
