@@ -12,6 +12,28 @@ use Tests\TestCase;
 
 class IncubatorTest extends TestCase
 {
+    public function test_manual_detection_returns_yolo_results_without_changing_camera_state(): void
+    {
+        Cache::put('incubator:total_eggs', 7, 3600);
+        Http::fake(['*' => Http::response([
+            'status' => 'success', 'engine' => 'yolo', 'total_eggs' => 2,
+            'detections' => [['id' => 1, 'class' => 'retak', 'confidence' => 0.9, 'box' => [1, 2, 3, 4]]],
+            'annotated_image' => 'data:image/jpeg;base64,abc',
+        ])]);
+
+        $this->postJson('/incubator/detect', ['image' => UploadedFile::fake()->image('tray.jpg')])
+            ->assertOk()->assertJsonPath('engine', 'yolo')->assertJsonPath('detections.0.class', 'retak');
+        $this->assertSame(7, Cache::get('incubator:total_eggs'));
+    }
+
+    public function test_manual_detection_validates_file_and_rejects_fallback(): void
+    {
+        $this->postJson('/incubator/detect', ['image' => UploadedFile::fake()->create('file.txt', 1, 'text/plain')])
+            ->assertUnprocessable()->assertJsonValidationErrors('image');
+        Http::fake(['*' => Http::response(['status' => 'success', 'engine' => 'opencv_fallback', 'total_eggs' => 0])]);
+        $this->postJson('/incubator/detect', ['image' => UploadedFile::fake()->image('tray.jpg')])->assertStatus(502);
+    }
+
     use RefreshDatabase;
 
     protected string $validKey = 'EggCamSecretKey_9876543210_abcdef1234567890';

@@ -963,6 +963,19 @@
                     <a id="inc-preview-download" class="btn-action btn-download" href="#" download="incubator.jpg">⬇️ Unduh Foto Ini</a>
                 </div>
 
+                <form id="inc-detect-form" style="display: grid; gap: 10px; margin: 0 0 20px;">
+                    <label for="inc-detect-image" class="control-label">Uji foto inkubator dengan YOLO (JPEG/PNG, maks. 5 MB)</label>
+                    <input id="inc-detect-image" name="image" type="file" accept="image/jpeg,image/png" required>
+                    <button id="inc-detect-button" class="btn-save-sm" type="submit">Deteksi foto</button>
+                    <div id="inc-detect-status" class="feedback-msg" role="status" aria-live="polite"></div>
+                    <div id="inc-detect-details" hidden>
+                        <h4>Rincian hasil deteksi</h4>
+                        <p id="inc-detect-summary"></p>
+                        <ul id="inc-detect-list"></ul>
+                    </div>
+                    <img id="inc-detect-result" alt="Hasil deteksi telur pada foto yang diunggah" style="display: none; width: 100%; max-height: 760px; object-fit: contain;" />
+                </form>
+
                 <!-- Grid Galeri 1 Jam Terakhir -->
                 <div id="inc-history-grid" class="history-grid">
                     <div style="color: var(--text-muted); font-size: 13px; grid-column: 1/-1;">Belum ada foto inkubator dalam 1 jam terakhir.</div>
@@ -1507,6 +1520,57 @@
             if (browserMs !== null) values.push(`Total browser hingga respons: ${browserMs.toFixed(0)} ms`);
             output.textContent = values.join(' · ');
         }
+
+        document.getElementById('inc-detect-form').addEventListener('submit', async (event) => {
+            event.preventDefault();
+            const input = document.getElementById('inc-detect-image');
+            const status = document.getElementById('inc-detect-status');
+            const button = document.getElementById('inc-detect-button');
+            const image = document.getElementById('inc-detect-result');
+            const details = document.getElementById('inc-detect-details');
+            const summary = document.getElementById('inc-detect-summary');
+            const list = document.getElementById('inc-detect-list');
+            if (!input.files[0]) return;
+            const body = new FormData();
+            body.append('image', input.files[0]);
+            button.disabled = true;
+            image.style.display = 'none';
+            details.hidden = true;
+            list.replaceChildren();
+            status.textContent = 'Menganalisis foto...';
+            try {
+                const response = await fetch('/incubator/detect', {
+                    method: 'POST', headers: { 'Accept': 'application/json', 'X-CSRF-TOKEN': csrfToken }, body
+                });
+                const result = await response.json();
+                if (!response.ok) throw new Error(result.errors?.image?.[0] || result.message || 'Deteksi gagal.');
+                const counts = result.detections.reduce((all, detection) => {
+                    const name = detection.class || 'tidak diketahui';
+                    all[name] = (all[name] || 0) + 1;
+                    return all;
+                }, {});
+                status.textContent = `Terdeteksi ${result.total_eggs} objek` + (result.total_eggs ? ': ' + Object.entries(counts).map(([name, count]) => `${name} ${count}`).join(', ') : '') + '. Hasil perlu diperiksa kembali.';
+                summary.textContent = `Status: ${result.status}. Model: ${result.engine}. Total: ${result.total_eggs}.`;
+                result.detections.forEach((detection) => {
+                    const item = document.createElement('li');
+                    const confidence = Number.isFinite(detection.confidence) ? `${(detection.confidence * 100).toFixed(2)}%` : 'tidak tersedia';
+                    item.textContent = `#${detection.id}: ${detection.class || 'tidak diketahui'}, keyakinan ${confidence}, posisi [${detection.box.join(', ')}].`;
+                    list.appendChild(item);
+                });
+                if (result.detections.length === 0) {
+                    const item = document.createElement('li');
+                    item.textContent = 'Tidak ada objek yang terdeteksi.';
+                    list.appendChild(item);
+                }
+                details.hidden = false;
+                image.src = result.annotated_image;
+                image.style.display = 'block';
+            } catch (error) {
+                status.textContent = error.message || 'Tidak dapat terhubung ke server.';
+            } finally {
+                button.disabled = false;
+            }
+        });
 
         document.getElementById('candling-upload-form').addEventListener('submit', async (event) => {
             event.preventDefault();

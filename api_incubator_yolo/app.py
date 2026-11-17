@@ -17,6 +17,7 @@ import base64
 import logging
 from pathlib import Path
 from typing import List, Dict, Any, Tuple, Optional
+from threading import Lock
 
 import cv2
 import numpy as np
@@ -32,6 +33,7 @@ DIR_MODELS.mkdir(parents=True, exist_ok=True)
 
 # ---------------------------------------------------------------- Inisialisasi Flask & CORS
 app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024
 
 @app.after_request
 def enable_cors(response):
@@ -45,6 +47,7 @@ def enable_cors(response):
 HAS_ULTRALYTICS = False
 yolo_model = None
 yolo_model_path: Optional[str] = None
+yolo_lock = Lock()
 
 try:
     from ultralytics import YOLO
@@ -319,7 +322,8 @@ def deteksi_telur_opencv(rgb_img: np.ndarray) -> List[Dict[str, Any]]:
 # ---------------------------------------------------------------- Detektor YOLO
 def deteksi_telur_yolo(rgb_img: np.ndarray, model, conf_thresh: float = 0.25) -> List[Dict[str, Any]]:
     """Deteksi telur menggunakan Ultralytics YOLO model."""
-    results = model(rgb_img, conf=conf_thresh, verbose=False)
+    bgr_img = cv2.cvtColor(rgb_img, cv2.COLOR_RGB2BGR)
+    results = model(bgr_img, conf=conf_thresh, verbose=False)
     detections: List[Dict[str, Any]] = []
 
     if results and len(results) > 0:
@@ -328,6 +332,8 @@ def deteksi_telur_yolo(rgb_img: np.ndarray, model, conf_thresh: float = 0.25) ->
             for b in res.boxes:
                 xyxy = b.xyxy[0].cpu().numpy()
                 conf = float(b.conf[0].cpu().numpy())
+                class_id = int(b.cls[0].item())
+                class_name = str(res.names[class_id])
                 x1, y1, x2, y2 = xyxy
                 w = int(x2 - x1)
                 h = int(y2 - y1)
@@ -338,6 +344,7 @@ def deteksi_telur_yolo(rgb_img: np.ndarray, model, conf_thresh: float = 0.25) ->
                     "id": 0,
                     "box": [x, y, w, h],
                     "confidence": round(conf, 4),
+                    "class": class_name,
                     "type": "yolo"
                 })
 
@@ -354,14 +361,15 @@ def gambar_anotasi(rgb_img: np.ndarray, detections: List[Dict[str, Any]]) -> np.
     thickness = max(2, int(min(h_img, w_img) / 300))
     font_scale = max(0.45, min(h_img, w_img) / 900.0)
 
-    # Palet warna RGB
-    color_box = (46, 204, 113)     # Emerald Green
-    color_bg_tag = (39, 174, 96)    # Darker Green for Tag
-    color_text = (255, 255, 255)    # Putih
-    color_center = (231, 76, 60)    # Merah untuk titik tengah
+    color_text = (255, 255, 255)
+    class_colors = {
+        "retak": ((231, 76, 60), (185, 28, 28)),
+        "utuh": ((46, 204, 113), (21, 128, 61)),
+    }
 
     for det in detections:
         x, y, w, h = det["box"]
+        color_box, color_bg_tag = class_colors.get(str(det.get("class", "")).lower(), ((128, 128, 128), (75, 75, 75)))
         cid = det.get("id", 1)
         conf = det.get("confidence", 0.95)
 
@@ -370,10 +378,10 @@ def gambar_anotasi(rgb_img: np.ndarray, detections: List[Dict[str, Any]]) -> np.
 
         # 2. Titik tengah telur (center marker)
         cx, cy = x + w // 2, y + h // 2
-        cv2.circle(annotated, (cx, cy), max(3, thickness + 1), color_center, -1)
+        cv2.circle(annotated, (cx, cy), max(3, thickness + 1), color_box, -1)
 
         # 3. Label badge: "Egg #1 (95%)"
-        label = f"Egg #{cid} ({int(conf * 100)}%)"
+        label = f"{det.get('class', 'Egg')} #{cid} ({int(conf * 100)}%)"
         (t_w, t_h), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)
 
         tag_y1 = max(0, y - t_h - 8)
@@ -447,7 +455,8 @@ def detect_incubator_eggs():
         # 2. Proses Deteksi (YOLO jika tersedia, atau OpenCV Fallback)
         engine_used = "opencv_fallback"
         if yolo_model is not None:
-            detections = deteksi_telur_yolo(rgb, yolo_model)
+            with yolo_lock:
+                detections = deteksi_telur_yolo(rgb, yolo_model)
             engine_used = "yolo"
         else:
             detections = deteksi_telur_opencv(rgb)
@@ -462,7 +471,8 @@ def detect_incubator_eggs():
             {
                 "id": int(d["id"]),
                 "box": [int(coord) for coord in d["box"]],
-                "confidence": float(d["confidence"])
+                "confidence": float(d["confidence"]),
+                "class": d.get("class")
             }
             for d in detections
         ]

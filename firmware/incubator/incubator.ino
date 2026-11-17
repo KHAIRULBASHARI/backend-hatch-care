@@ -9,8 +9,8 @@
  * Peningkatan & Tuning:
  *   1. LCD 20x4 informatif: Suhu + Setpoint, Kelembaban + Mode, Hitung mundur putar telur, MQTT + WiFi RSSI.
  *   2. Boot sinkron: Menunggu koneksi Wi-Fi, waktu NTP, dan handshake MQTT WSS total sebelum loop.
- *   3. LED internal ESP32 dinonaktifkan: GPIO 33 dipaksa HIGH (mati) dan flash LED tidak dipaksa saat foto.
- *   4. Pin I/O dipertahankan 100%: Heater (GPIO 4), Motor (GPIO 2), DHT (GPIO 15), I2C (14, 13).
+ *   3. LED merah GPIO33 HIGH dan LED putih GPIO4 LOW: keduanya mati.
+ *   4. Relay pemanas/penerangan GPIO12 (boot LOW), Motor GPIO2, DHT GPIO15, I2C GPIO14/13.
  *   5. Koordinasi Dinamo & Kamera: Pemotretan ditunda saat motor berputar (anti-blur & anti-drop voltase).
  *   6. Filter Sanity DHT22: Menyaring glitch/spike nilai suhu palsu (15 - 50 °C).
  *   7. Watchdog WiFi non-blocking di loop utama.
@@ -30,6 +30,7 @@
 #include "soc/rtc_cntl_reg.h"
 #include "mqtt_client.h"
 #include "esp_crt_bundle.h"
+#include "driver/gpio.h"
 
 // ─── KONFIGURASI ──────────────────────────────────────────────────────────────────
 #if __has_include("secrets.h")
@@ -62,11 +63,12 @@
   #define JPEG_QUALITY 4                    // Kualitas mentok tertinggi (4 = kompresi minimal, sangat tajam)
 #endif
 
-// Pin AI-Thinker (DIJAGA TETAP SESUAI WIRING HARDWARE)
+// Pin AI-Thinker: relay aktif-HIGH; GPIO12 wajib LOW saat boot (pull-down 10 kΩ).
 #define PIN_I2C_SDA      14
 #define PIN_I2C_SCL      13
 #define PIN_DHT          15
-#define PIN_RELAY_HEATER 4    // Relay pemanas
+#define PIN_RELAY_HEATER 12   // Satu lampu: pemanas dan penerangan foto
+#define PIN_FLASH_LED     4   // LED putih onboard selalu mati
 #define PIN_RELAY_MOTOR  2    // Relay dinamo pembalik telur
 #define RELAY_ON         HIGH
 #define RELAY_OFF        LOW
@@ -95,6 +97,9 @@ const uint32_t UPLOAD_MIN_S          = 15;     // mengikuti interval minimal di 
 const uint32_t UPLOAD_MAX_S          = 3600;
 const uint32_t UPLOAD_TIMEOUT_MS     = 12000;
 const uint8_t  DHT_MAX_FAILS         = 3;      // NaN berulang dari DHT baru trigger error
+const uint32_t SENSOR_STALE_MS       = 8000;
+const uint32_t PHOTO_LIGHT_SETTLE_MS = 600;
+const uint32_t PHOTO_LIGHT_MAX_MS    = 10000;
 const int      CAPTURE_TRIES         = 3;
 
 enum LampMode : uint8_t { LAMP_AUTO, LAMP_ON, LAMP_OFF };
@@ -123,6 +128,9 @@ volatile uint32_t motorDurationMs   = 15000UL;
 volatile uint32_t uploadIntervalMs  = 120000UL;
 volatile bool     motorRequest      = false;
 volatile bool     manualLight       = false;
+volatile bool     photoLightRequested = false;
+uint32_t          photoLightStartedAt = 0;
+volatile uint32_t lastGoodSensorAt   = 0;
 volatile bool     manualCaptureRequest = false;
 
 volatile float    currentTemp = NAN;
@@ -167,12 +175,15 @@ void applyHeaterPin() {
   uint32_t now = millis();
   float t = currentTemp;
   bool overheat = isfinite(t) && t >= TEMP_HARD_LIMIT;
-  bool tempValid = isfinite(t) && t > 0;
-  bool canHeat = tempValid && !overheat && heaterState;
-  bool canLight = !overheat && manualLight;
-  bool want = canHeat || canLight;
+  bool tempValid = isfinite(t) && t > 0 && lastGoodSensorAt != 0 &&
+                   now - lastGoodSensorAt <= SENSOR_STALE_MS;
+  if (photoLightRequested && (now - photoLightStartedAt >= PHOTO_LIGHT_MAX_MS || !tempValid || overheat)) {
+    photoLightRequested = false;
+  }
+  bool want = tempValid && !overheat && (heaterState || manualLight || photoLightRequested);
   if (want == heaterPinOn) return;
-  if (!overheat && heaterPinChangedAt != 0 && now - heaterPinChangedAt < RELAY_MIN_SWITCH_MS) return;
+  bool unsafe = !tempValid || overheat;
+  if (!unsafe && heaterPinChangedAt != 0 && now - heaterPinChangedAt < RELAY_MIN_SWITCH_MS) return;
 
   heaterPinOn = want;
   heaterPinChangedAt = now;
@@ -196,6 +207,42 @@ void updateThermostat() {
   else if (t >= tempSetpointMax)   h = false;
   heaterState = h;
   refreshHeaterPin();
+}
+
+bool photoLightReady() {
+  portENTER_CRITICAL(&heaterMux);
+  applyHeaterPin();
+  bool ready = photoLightRequested && heaterPinOn;
+  portEXIT_CRITICAL(&heaterMux);
+  return ready;
+}
+
+bool beginPhotoLight() {
+  portENTER_CRITICAL(&heaterMux);
+  photoLightStartedAt = millis();
+  photoLightRequested = true;
+  applyHeaterPin();
+  portEXIT_CRITICAL(&heaterMux);
+
+  uint32_t started = millis();
+  while (millis() - started < RELAY_MIN_SWITCH_MS + PHOTO_LIGHT_SETTLE_MS + 250) {
+    portENTER_CRITICAL(&heaterMux);
+    applyHeaterPin();
+    bool active = photoLightRequested;
+    bool settled = heaterPinOn && millis() - heaterPinChangedAt >= PHOTO_LIGHT_SETTLE_MS;
+    portEXIT_CRITICAL(&heaterMux);
+    if (!active) return false;
+    if (settled) return true;
+    delay(20);
+  }
+  return false;
+}
+
+void endPhotoLight() {
+  portENTER_CRITICAL(&heaterMux);
+  photoLightRequested = false;
+  portEXIT_CRITICAL(&heaterMux);
+  updateThermostat();
 }
 
 // ─── MOTOR PEMBALIK TELUR ─────────────────────────────────────────────────────────
@@ -320,14 +367,22 @@ bool capturePhotoTo(PhotoBuffer &target) {
     return false;
   }
 
+  if (!beginPhotoLight()) {
+    endPhotoLight();
+    xSemaphoreGive(cameraMutex);
+    Serial.println("[CAPTURE] Lampu belum siap atau suhu tidak aman");
+    return false;
+  }
+
   bool ok = false;
   int qUsed = JPEG_QUALITY;
   for (int t = 0; t < CAPTURE_TRIES; t++) {
+    if (!photoLightReady()) break;
     camera_fb_t *old = esp_camera_fb_get();
     if (old) esp_camera_fb_return(old);
 
     camera_fb_t *fb = esp_camera_fb_get();
-    if (jpegValid(fb)) {
+    if (jpegValid(fb) && photoLightReady()) {
       ok = saveToBuffer(target, fb->buf, fb->len);
       esp_camera_fb_return(fb);
       break;
@@ -343,6 +398,7 @@ bool capturePhotoTo(PhotoBuffer &target) {
     if (s) s->set_quality(s, JPEG_QUALITY);
   }
 
+  endPhotoLight();
   if (!ok) {
     camStop();
   }
@@ -667,6 +723,7 @@ void telemetryTask(void *) {
   uint32_t lastTelemetry = 0;
   for (;;) {
     uint32_t now = millis();
+    refreshHeaterPin();
     if (WiFi.status() == WL_CONNECTED) {
       if (!mqttClient) initMqtt();
       if (mqttConnected && (telemetryRequested || now - lastTelemetry >= 2000)) {
@@ -914,11 +971,15 @@ void setup() {
   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
   esp_log_level_set("gpio", ESP_LOG_NONE);
 
-  // Inisialisasi pin relay (TETAP SESUAI PIN ASLI)
+  gpio_set_level((gpio_num_t)PIN_RELAY_HEATER, RELAY_OFF);
+  gpio_set_level((gpio_num_t)PIN_RELAY_MOTOR, RELAY_OFF);
+  gpio_set_level((gpio_num_t)PIN_FLASH_LED, LOW);
   pinMode(PIN_RELAY_HEATER, OUTPUT);
   pinMode(PIN_RELAY_MOTOR, OUTPUT);
+  pinMode(PIN_FLASH_LED, OUTPUT);
   digitalWrite(PIN_RELAY_HEATER, RELAY_OFF);
   digitalWrite(PIN_RELAY_MOTOR, RELAY_OFF);
+  digitalWrite(PIN_FLASH_LED, LOW);
 
   // Nonaktifkan LED merah internal ESP32 (GPIO 33 active LOW pada AI-Thinker)
   pinMode(33, OUTPUT);
@@ -1041,6 +1102,7 @@ void loop() {
     if (valid) {
       currentTemp = t;
       currentHum = h;
+      lastGoodSensorAt = now;
       dhtFails = 0;
       telemetryRequested = true;
     } else if (++dhtFails >= DHT_MAX_FAILS) {

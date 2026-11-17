@@ -8,6 +8,8 @@ use Illuminate\Http\Request;
 use Illuminate\Http\UploadedFile;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
 use Illuminate\Validation\ValidationException;
@@ -206,6 +208,29 @@ class IncubatorController extends Controller
             'timestamp' => $timestamp,
             'control' => $control,
         ]);
+    }
+
+    public function detectManual(Request $request)
+    {
+        $request->validate(['image' => ['required', 'file', 'image', 'mimes:jpg,jpeg,png', 'max:5120']]);
+        $url = config('services.incubator.api_url');
+        if (! $url) {
+            return response()->json(['message' => 'Alamat API YOLO inkubator belum dikonfigurasi.'], 503);
+        }
+
+        try {
+            $file = $request->file('image');
+            $response = Http::timeout(30)->attach('image', file_get_contents($file->getRealPath()), 'incubator.'.$file->guessExtension())->post($url);
+            $data = $response->json();
+            if (! $response->successful() || ! is_array($data) || ($data['status'] ?? null) !== 'success' || ($data['engine'] ?? null) !== 'yolo' || ! isset($data['total_eggs'], $data['detections'], $data['annotated_image'])) {
+                return response()->json(['message' => 'Deteksi YOLO gagal atau model belum tersedia.'], 502);
+            }
+
+            return response()->json($data);
+        } catch (\Throwable $e) {
+            Log::warning('Gagal memanggil API YOLO inkubator: '.$e->getMessage());
+            return response()->json(['message' => 'Layanan YOLO inkubator tidak tersedia.'], 502);
+        }
     }
 
     /**
