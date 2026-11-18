@@ -16,7 +16,7 @@ class IncubatorMqtt
 
         $persistent = array_intersect_key($settings, array_flip([
             'lampMode', 'tempMin', 'tempMax', 'motorIntervalHours',
-            'motorDurationSeconds', 'captureIntervalSeconds',
+            'motorDurationSeconds', 'captureIntervalSeconds', 'motorPaused',
         ]));
         if ($persistent !== []) {
             $saved = Process::timeout(5)
@@ -29,6 +29,11 @@ class IncubatorMqtt
             if (! $saved->successful()) {
                 throw new RuntimeException('Pengaturan MQTT belum tersimpan di broker.');
             }
+        }
+
+        unset($payload['motorPaused']);
+        if ($payload === []) {
+            return;
         }
 
         $result = Process::timeout(5)

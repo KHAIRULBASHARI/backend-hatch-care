@@ -3,6 +3,7 @@
 namespace App\Http\Controllers;
 
 use App\Models\CaptureJob;
+use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
@@ -11,6 +12,33 @@ use Illuminate\Support\Facades\Storage;
 
 class EggController extends Controller
 {
+    private const DEFAULT_SETTINGS = [
+        'exposure' => 500,
+        'gain' => 0,
+        'quality' => 4,
+        'settle_ms' => 350,
+    ];
+
+    public function settings(): JsonResponse
+    {
+        return response()->json(Cache::get('candling:settings', self::DEFAULT_SETTINGS));
+    }
+
+    public function updateSettings(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'exposure' => 'sometimes|required|integer|between:0,1200',
+            'gain' => 'sometimes|required|integer|between:0,30',
+            'quality' => 'sometimes|required|integer|between:4,15',
+            'settle_ms' => 'sometimes|required|integer|between:100,3000',
+        ]);
+
+        $settings = array_replace(Cache::get('candling:settings', self::DEFAULT_SETTINGS), array_map('intval', $validated));
+        Cache::forever('candling:settings', $settings);
+
+        return response()->json($settings);
+    }
+
     /**
      * Request a new capture job.
      */
@@ -23,7 +51,7 @@ class EggController extends Controller
             'settle_ms' => 'nullable|integer|between:100,3000',
         ]);
 
-        $jobData = array_filter($validated, fn ($val) => $val !== null);
+        $jobData = array_replace(Cache::get('candling:settings', self::DEFAULT_SETTINGS), array_filter($validated, fn ($val) => $val !== null));
 
         $job = CaptureJob::create($jobData);
 
@@ -40,13 +68,13 @@ class EggController extends Controller
     {
         try {
             $deviceKey = config('services.device.key') ?? env('DEVICE_KEY', 'EggCamSecretKey_9876543210_abcdef1234567890');
-            $topic = 'candling/' . $deviceKey . '/job';
+            $topic = 'candling/'.$deviceKey.'/job';
             $payload = [
                 'job' => $job->id,
                 'exp' => $job->exposure ?? 500,
                 'gain' => $job->gain ?? 0,
                 'q' => $job->quality ?? 4,
-                'delay' => $job->settle_ms ?? 250,
+                'delay' => $job->settle_ms ?? 350,
             ];
             $json = json_encode($payload, JSON_UNESCAPED_SLASHES);
             if (function_exists('exec')) {
@@ -61,7 +89,7 @@ class EggController extends Controller
                 'taken_at' => now(),
             ]);
         } catch (\Throwable $e) {
-            Log::warning('Gagal publish MQTT candling job: ' . $e->getMessage());
+            Log::warning('Gagal publish MQTT candling job: '.$e->getMessage());
         }
     }
 

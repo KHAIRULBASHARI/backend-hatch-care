@@ -113,8 +113,19 @@ class IncubatorMqttTests(unittest.TestCase):
                 self.assertIn('UPLOAD_TIMEOUT_MS', upload)
                 self.assertIn('client.connect("iot.walker880.my.id", 80, 4000)', upload)
 
-    def test_duplicate_sketches_remain_identical(self):
-        self.assertEqual(SKETCHES[0].read_bytes(), SKETCHES[1].read_bytes())
+    def test_motor_pause_is_restored_and_blocks_all_motor_requests(self):
+        source = SKETCHES[0].read_text(encoding='utf-8')
+        commands = function_body(source, 'applyCloudCommands')
+        motor = function_body(source, 'updateMotor')
+        self.assertIn('allowTriggers ? nullptr : jsonValue(json, "motorPaused")', commands)
+        self.assertIn('prefs.putBool("motorPaused", value)', commands)
+        self.assertIn('prefs.getBool("motorPaused", false)', function_body(source, 'setup'))
+        self.assertIn('digitalWrite(PIN_RELAY_MOTOR, RELAY_OFF)', commands)
+        self.assertIn('motorRequest = false', commands)
+        self.assertIn('isNew && !motorPaused && !isMotorRunning', source)
+        self.assertLess(motor.index('if (motorPaused)'), motor.index('digitalWrite(PIN_RELAY_MOTOR, RELAY_ON)'))
+        self.assertIn('if (!paused) motorRequest = true', function_body(source, 'handleTurn'))
+        self.assertIn('motorPaused', function_body(source, 'publishTelemetry'))
 
 
 if __name__ == '__main__':

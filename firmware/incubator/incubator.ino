@@ -127,6 +127,7 @@ volatile uint32_t motorIntervalMs   = 4UL * 3600000UL;
 volatile uint32_t motorDurationMs   = 15000UL;
 volatile uint32_t uploadIntervalMs  = 120000UL;
 volatile bool     motorRequest      = false;
+volatile bool     motorPaused       = false;
 volatile bool     manualLight       = false;
 volatile bool     photoLightRequested = false;
 uint32_t          photoLightStartedAt = 0;
@@ -154,6 +155,7 @@ char     lastCaptureCommandId[48] = "";
 uint32_t storedUploadSeconds = 120;
 
 portMUX_TYPE      heaterMux   = portMUX_INITIALIZER_UNLOCKED;
+portMUX_TYPE      motorMux    = portMUX_INITIALIZER_UNLOCKED;
 SemaphoreHandle_t cameraMutex = NULL;          // HANYA mengunci saat kamera fisik memotret
 bool              camUp       = false;
 
@@ -247,14 +249,20 @@ void endPhotoLight() {
 
 // ─── MOTOR PEMBALIK TELUR ─────────────────────────────────────────────────────────
 void updateMotor(uint32_t now) {
+  portENTER_CRITICAL(&motorMux);
+  if (motorPaused) {
+    motorRequest = false;
+    portEXIT_CRITICAL(&motorMux);
+    return;
+  }
   if (isMotorRunning) {
     if (now - motorStartTime >= motorDurationMs) {
       digitalWrite(PIN_RELAY_MOTOR, RELAY_OFF);
       isMotorRunning = false;
       lastMotorTurn = now;
       telemetryRequested = true;
-      Serial.println("[MOTOR] selesai");
     }
+    portEXIT_CRITICAL(&motorMux);
     return;
   }
   if (motorRequest || now - lastMotorTurn >= motorIntervalMs) {
@@ -263,8 +271,8 @@ void updateMotor(uint32_t now) {
     isMotorRunning = true;
     motorStartTime = now;
     telemetryRequested = true;
-    Serial.println("[MOTOR] berputar");
   }
+  portEXIT_CRITICAL(&motorMux);
 }
 
 // ─── KAMERA (UXGA 1600x1200, FB TUNGGAL GRAB_WHEN_EMPTY = TANPA RESET AWB & TANPA GANGGUAN DMA) ──
@@ -422,6 +430,40 @@ static bool jsonNumber(const String &json, const char *key, float &out) {
 }
 
 void applyCloudCommands(const String &json, bool allowTriggers) {
+  const char *paused = allowTriggers ? nullptr : jsonValue(json, "motorPaused");
+  if (paused) {
+    while (*paused == ' ' || *paused == '\t' || *paused == '\r' || *paused == '\n') paused++;
+    bool value;
+    size_t len;
+    if (!strncmp(paused, "true", 4)) { value = true; len = 4; }
+    else if (!strncmp(paused, "false", 5)) { value = false; len = 5; }
+    else len = 0;
+    if (len) {
+      const char *end = paused + len;
+      while (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n') end++;
+      if (*end == ',' || *end == '}') {
+        portENTER_CRITICAL(&motorMux);
+        bool changed = motorPaused != value;
+        motorPaused = value;
+        if (value) {
+          motorRequest = false;
+          digitalWrite(PIN_RELAY_MOTOR, RELAY_OFF);
+          if (isMotorRunning) lastMotorTurn = millis();
+          isMotorRunning = false;
+        } else if (changed) {
+          lastMotorTurn = millis();
+        }
+        portEXIT_CRITICAL(&motorMux);
+        if (changed) {
+          Preferences prefs;
+          if (prefs.begin("incubator", false)) {
+            prefs.putBool("motorPaused", value);
+            prefs.end();
+          }
+        }
+      }
+    }
+  }
   // Hanya perintah non-retained boleh memicu satu putaran/foto.
   const char *capReq = jsonValue(json, "triggerCapture");
   const char *capAct = jsonValue(json, "action");
@@ -478,10 +520,9 @@ void applyCloudCommands(const String &json, bool allowTriggers) {
         }
       }
     }
-    if (isNew && !isMotorRunning) {
-      motorRequest = true;
-      Serial.println("[CMD] Putar dinamo via Cloud!");
-    }
+    portENTER_CRITICAL(&motorMux);
+    if (isNew && !motorPaused && !isMotorRunning) motorRequest = true;
+    portEXIT_CRITICAL(&motorMux);
   }
 
   const char *mode = jsonValue(json, "lampMode");
@@ -680,7 +721,7 @@ void publishTelemetry() {
   int32_t turnSec = secondsUntilTurn();
   char json[512];
   int length = snprintf(json, sizeof(json),
-    "{\"temp\":%s,\"temperature\":%s,\"hum\":%s,\"humidity\":%s,\"heater\":%s,\"lamp\":%s,\"lampMode\":\"%s\",\"motor\":%s,\"tempMin\":%.1f,\"tempMax\":%.1f,\"motorIntervalHours\":%.2f,\"motorDurationSeconds\":%lu,\"captureIntervalSeconds\":%lu,\"turnCountdownSec\":%ld,\"rssi\":%d,\"uptime\":%lu}",
+    "{\"temp\":%s,\"temperature\":%s,\"hum\":%s,\"humidity\":%s,\"heater\":%s,\"lamp\":%s,\"lampMode\":\"%s\",\"motor\":%s,\"motorPaused\":%s,\"tempMin\":%.1f,\"tempMax\":%.1f,\"motorIntervalHours\":%.2f,\"motorDurationSeconds\":%lu,\"captureIntervalSeconds\":%lu,\"turnCountdownSec\":%ld,\"rssi\":%d,\"uptime\":%lu}",
     isfinite(t) ? String(t, 1).c_str() : "null",
     isfinite(t) ? String(t, 1).c_str() : "null",
     isfinite(h) ? String((int)h).c_str() : "null",
@@ -689,6 +730,7 @@ void publishTelemetry() {
     heaterPinOn ? "true" : "false",
     LAMP_MODE_NAME[lampMode],
     isMotorRunning ? "true" : "false",
+    motorPaused ? "true" : "false",
     (float)tempSetpointMin,
     (float)tempSetpointMax,
     (float)motorIntervalMs / 3600000.0f,
@@ -881,8 +923,11 @@ void handleStatus() {
 }
 
 void handleTurn() {
-  motorRequest = true;
-  server.send(200, "text/plain", "Perintah putar dinamo diterima");
+  portENTER_CRITICAL(&motorMux);
+  bool paused = motorPaused;
+  if (!paused) motorRequest = true;
+  portEXIT_CRITICAL(&motorMux);
+  server.send(paused ? 409 : 200, "text/plain", paused ? "Dinamo sedang dijeda" : "Perintah putar dinamo diterima");
 }
 
 void handleLed() {
@@ -993,6 +1038,7 @@ void setup() {
   if (prefs.begin("incubator", true)) {
     prefs.getString("lastMotorCmd", lastMotorCommandId, sizeof(lastMotorCommandId));
     prefs.getString("lastCaptureCmd", lastCaptureCommandId, sizeof(lastCaptureCommandId));
+    motorPaused = prefs.getBool("motorPaused", false);
     storedUploadSeconds = constrain(prefs.getUInt("photoSeconds", 120), UPLOAD_MIN_S, UPLOAD_MAX_S);
     uploadIntervalMs = storedUploadSeconds * 1000UL;
     prefs.end();

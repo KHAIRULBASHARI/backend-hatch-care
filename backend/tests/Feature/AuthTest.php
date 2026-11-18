@@ -2,6 +2,7 @@
 
 namespace Tests\Feature;
 
+use App\Models\CaptureJob;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Hash;
@@ -106,5 +107,36 @@ class AuthTest extends TestCase
             ->assertStatus(200);
 
         $this->assertDatabaseCount('personal_access_tokens', 0);
+    }
+
+    public function test_protected_endpoints_require_a_token(): void
+    {
+        foreach (['/api/egg/status', '/api/egg/history', '/api/egg/job/1', '/api/candling/settings', '/api/incubator/latest', '/api/incubator/history', '/api/incubator/photo/test.jpg', '/api/incubator/control'] as $url) {
+            $this->getJson($url)->assertUnauthorized();
+        }
+
+        foreach (['/api/egg/capture', '/api/candling/settings', '/api/incubator/control'] as $url) {
+            $this->postJson($url)->assertUnauthorized();
+        }
+    }
+
+    public function test_shared_candling_settings_are_validated_and_used_for_captures(): void
+    {
+        $token = User::factory()->create()->createToken('test')->plainTextToken;
+        $headers = ['Authorization' => "Bearer {$token}"];
+        $defaults = ['exposure' => 500, 'gain' => 0, 'quality' => 4, 'settle_ms' => 350];
+
+        $this->getJson('/api/candling/settings', $headers)->assertOk()->assertExactJson($defaults);
+        $this->postJson('/api/candling/settings', ['quality' => 3], $headers)->assertUnprocessable()->assertJsonValidationErrors('quality');
+        $this->postJson('/api/candling/settings', ['exposure' => 600, 'gain' => 5], $headers)->assertOk()
+            ->assertJson(['exposure' => 600, 'gain' => 5, 'quality' => 4, 'settle_ms' => 350]);
+        $this->getJson('/api/candling/settings', $headers)->assertJsonPath('exposure', 600);
+
+        $id = $this->postJson('/api/egg/capture', ['gain' => 7], $headers)->assertOk()->json('job');
+        $job = CaptureJob::findOrFail($id);
+        $this->assertEquals([600, 7, 4, 350], [$job->exposure, $job->gain, $job->quality, $job->settle_ms]);
+        $this->getJson('/api/egg/job/'.$id, $headers)->assertOk();
+        $this->getJson('/api/egg/status', $headers)->assertOk();
+        $this->getJson('/api/egg/history', $headers)->assertOk();
     }
 }

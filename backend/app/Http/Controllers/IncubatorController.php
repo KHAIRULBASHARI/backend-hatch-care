@@ -21,6 +21,7 @@ class IncubatorController extends Controller
     private const DEFAULT_CONTROL = [
         'lampMode' => 'auto',
         'motorManualRequest' => false,
+        'motorPaused' => false,
         'motorCommandId' => null,
         'tempMin' => 37.0,
         'tempMax' => 38.0,
@@ -171,7 +172,9 @@ class IncubatorController extends Controller
         // Simpan file JPEG ke disk untuk riwayat 1 jam terakhir
         $id = $now->format('Ymd_His').'_'.Str::lower(Str::random(4));
         $filename = "inc_{$id}.jpg";
-        Storage::disk('public')->put("incubator/{$filename}", $content);
+        if (! Storage::disk('public')->put("incubator/{$filename}", $content)) {
+            abort(500, 'Foto gagal disimpan.');
+        }
         $photoUrl = "/incubator/photo/{$filename}";
 
         $entry = [
@@ -187,13 +190,63 @@ class IncubatorController extends Controller
             'motor' => $motor !== null ? (bool) $motor : Cache::get('incubator:motor'),
         ];
 
-        $history = $this->pruneAndGetHistory();
-        array_unshift($history, $entry);
-        Cache::put('incubator:history', $history, self::HISTORY_TTL_SECONDS + 600);
+        Cache::lock('incubator:photo-lock', 15)->block(3, function () use ($entry, $filename, $photoUrl, $timestamp, $cacheSeconds, $id) {
+            $history = $this->pruneAndGetHistory();
+            array_unshift($history, $entry);
+            Cache::put('incubator:history', $history, self::HISTORY_TTL_SECONDS + 600);
+            Cache::put('incubator:latest_filename', $filename, $cacheSeconds);
+            Cache::put('incubator:latest_url', $photoUrl, $cacheSeconds);
+            Cache::put('incubator:last_seen', $timestamp, $cacheSeconds);
+            Cache::put('incubator:detection', ['status' => 'pending', 'total_eggs' => null, 'detections' => [], 'photo_id' => $id], $cacheSeconds);
+        });
 
-        Cache::put('incubator:latest_filename', $filename, $cacheSeconds);
-        Cache::put('incubator:latest_url', $photoUrl, $cacheSeconds);
-        Cache::put('incubator:last_seen', $timestamp, $cacheSeconds);
+        $detection = ['status' => 'failed', 'total_eggs' => null, 'detections' => [], 'photo_id' => $id];
+        try {
+            $url = config('services.incubator.api_url');
+            if ($url) {
+                $result = Http::timeout(30)->attach('image', $content, $filename)->post($url);
+                $data = $result->json();
+                if ($result->successful() && is_array($data) && ($data['status'] ?? null) === 'success'
+                    && ($data['engine'] ?? null) === 'yolo' && isset($data['total_eggs'], $data['detections'])
+                    && is_int($data['total_eggs']) && $data['total_eggs'] >= 0 && is_array($data['detections'])
+                    && array_is_list($data['detections']) && count(array_filter($data['detections'], fn ($item) => ! is_array($item) || ! is_string($item['class'] ?? null))) === 0) {
+                    $detection = ['status' => 'success', 'total_eggs' => (int) $data['total_eggs'], 'detections' => $data['detections'], 'photo_id' => $id];
+                }
+            }
+        } catch (\Throwable $e) {
+            Log::warning('Deteksi inkubator gagal: '.$e->getMessage());
+        }
+        $pauseError = false;
+        if ($detection['status'] === 'success' && collect($detection['detections'])->contains(fn ($item) => strtolower(trim($item['class'])) === 'retak')) {
+            try {
+                Cache::lock('incubator:control-lock', 30)->block(3, function () {
+                    $current = $this->controlSettings();
+                    $current['motorPaused'] = true;
+                    Cache::forever('incubator:control', $current);
+                    app(IncubatorMqtt::class)->publish(['motorPaused' => true], $current);
+                });
+            } catch (\Throwable $e) {
+                $pauseError = true;
+                Log::warning('Penghentian motor inkubator gagal dikirim: '.$e->getMessage());
+            }
+        }
+        if ($pauseError) {
+            $detection['motor_pause'] = 'publish_failed';
+        }
+        Cache::lock('incubator:photo-lock', 15)->block(3, function () use ($id, $detection, $cacheSeconds) {
+            $history = Cache::get('incubator:history', []);
+            foreach ($history as &$item) {
+                if (($item['id'] ?? null) === $id) {
+                    $item['detection'] = $detection;
+                    break;
+                }
+            }
+            unset($item);
+            Cache::put('incubator:history', $history, self::HISTORY_TTL_SECONDS + 600);
+            if ((Cache::get('incubator:detection')['photo_id'] ?? null) === $id) {
+                Cache::put('incubator:detection', $detection, $cacheSeconds);
+            }
+        });
 
         // Foto sudah berhasil di-upload, reset trigger capture agar tidak looping
         Cache::forget('incubator:trigger_capture');
@@ -206,7 +259,8 @@ class IncubatorController extends Controller
             'message' => 'Incubator snapshot saved',
             'url' => $photoUrl,
             'timestamp' => $timestamp,
-            'control' => $control,
+            'control' => $this->controlSettings(),
+            'detection' => $detection,
         ]);
     }
 
@@ -229,6 +283,7 @@ class IncubatorController extends Controller
             return response()->json($data);
         } catch (\Throwable $e) {
             Log::warning('Gagal memanggil API YOLO inkubator: '.$e->getMessage());
+
             return response()->json(['message' => 'Layanan YOLO inkubator tidak tersedia.'], 502);
         }
     }
@@ -261,7 +316,7 @@ class IncubatorController extends Controller
         return response()->json([
             'status' => 'success',
             'ttl_seconds' => self::HISTORY_TTL_SECONDS,
-            'history' => $this->pruneAndGetHistory(),
+            'history' => Cache::lock('incubator:photo-lock', 15)->block(3, fn () => $this->pruneAndGetHistory()),
         ]);
     }
 
@@ -279,6 +334,7 @@ class IncubatorController extends Controller
                 'motorIntervalHours' => 'sometimes|required|integer|between:1,24',
                 'motorDurationSeconds' => 'sometimes|required|integer|between:1,180',
                 'motorManualRequest' => 'sometimes|boolean',
+                'motorPaused' => 'sometimes|required|boolean',
                 'triggerMotor' => 'sometimes|boolean',
                 'triggerCapture' => 'sometimes|boolean',
                 'captureManual' => 'sometimes|boolean',
@@ -287,7 +343,7 @@ class IncubatorController extends Controller
 
             $mqttPayload = [];
 
-            $current = Cache::lock('incubator:control-lock', 15)->block(3, function () use ($request, &$mqttPayload) {
+            $current = Cache::lock('incubator:control-lock', 30)->block(3, function () use ($request, &$mqttPayload) {
                 $current = $this->controlSettings();
                 if ($request->has('lampMode')) {
                     $mode = strtolower((string) $request->input('lampMode'));
@@ -303,6 +359,10 @@ class IncubatorController extends Controller
                         $mqttPayload['motorManualRequest'] = true;
                         $mqttPayload['motorCommandId'] = $current['motorCommandId'];
                     }
+                }
+                if ($request->has('motorPaused')) {
+                    $current['motorPaused'] = $request->boolean('motorPaused');
+                    $mqttPayload['motorPaused'] = $current['motorPaused'];
                 }
                 if ($request->has('triggerCapture') || $request->has('captureManual') || $request->input('action') === 'capture') {
                     $current['triggerCapture'] = true;
@@ -345,7 +405,7 @@ class IncubatorController extends Controller
                         throw new HttpResponseException(response()->json([
                             'status' => 'error',
                             'transport' => 'mqtt',
-                            'message' => 'Broker MQTT tidak tersedia. Perintah belum dikirim.',
+                            'message' => 'Publikasi MQTT gagal; sebagian pengaturan mungkin sudah diterima broker. Status perangkat belum diketahui.',
                         ], 503));
                     }
                 }
@@ -396,6 +456,7 @@ class IncubatorController extends Controller
         $humidity = $request->input('humidity') ?? $request->input('hum');
         $lamp = $request->input('heater') ?? $request->input('lamp');
         $motor = $request->input('motor');
+        $motorPaused = $request->input('motorPaused');
         $rssi = $request->input('rssi');
 
         if ($temp !== null) {
@@ -410,6 +471,9 @@ class IncubatorController extends Controller
         if ($motor !== null) {
             Cache::put('incubator:motor', (bool) $motor, 3600);
         }
+        if ($motorPaused !== null && in_array($motorPaused, [true, false, 0, 1, '0', '1'], true)) {
+            Cache::put('incubator:motorPaused', filter_var($motorPaused, FILTER_VALIDATE_BOOLEAN), 3600);
+        }
         if ($rssi !== null) {
             Cache::put('incubator:rssi', (int) $rssi, 3600);
         }
@@ -423,8 +487,12 @@ class IncubatorController extends Controller
      */
     public function latest(Request $request)
     {
-        $history = $this->pruneAndGetHistory();
+        $history = Cache::lock('incubator:photo-lock', 15)->block(3, fn () => $this->pruneAndGetHistory());
         $latestEntry = $history[0] ?? null;
+        $detection = $latestEntry['detection'] ?? Cache::get('incubator:detection');
+        if (($detection['photo_id'] ?? null) !== ($latestEntry['id'] ?? null)) {
+            $detection = null;
+        }
 
         $lastSeen = Cache::get('incubator:last_seen') ?? ($latestEntry['timestamp'] ?? null);
         $imageUrl = $latestEntry['url'] ?? Cache::get('incubator:latest_url');
@@ -444,12 +512,14 @@ class IncubatorController extends Controller
             'online' => ($ago !== null && $ago <= $onlineSeconds),
             'image' => $imageUrl,
             'url' => $imageUrl,
-            'total_eggs' => (int) Cache::get('incubator:total_eggs', 0),
-            'detections' => Cache::get('incubator:detections', []),
+            'total_eggs' => $detection['total_eggs'] ?? null,
+            'detections' => $detection['detections'] ?? [],
+            'detection' => $detection,
             'temperature' => Cache::get('incubator:temperature'),
             'humidity' => Cache::get('incubator:humidity'),
             'lamp' => Cache::get('incubator:lamp'),
             'motor' => Cache::get('incubator:motor'),
+            'motorPaused' => Cache::get('incubator:motorPaused'),
             'rssi' => Cache::get('incubator:rssi'),
             'control' => $control,
             'history' => $history,
